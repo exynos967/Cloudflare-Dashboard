@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { toast } from 'vue-sonner'
 import {
   BarChart3,
@@ -70,21 +70,30 @@ const totalRequestsTrend = computed(() =>
 
 /* ---------- 加载 ---------- */
 
+/** 域名列表加载失败信息（区分错误态与「还没有域名」空态） */
+const zonesError = ref('')
+
 async function loadZones() {
   zonesLoading.value = true
+  zonesError.value = ''
   try {
-    const list = await zonesApi.list({ per_page: 50 })
+    const list = await zonesApi.listAll()
     zones.value = list
     if (!selectedZoneId.value && list.length) selectedZoneId.value = list[0].id
   } catch (e) {
-    toast.error('加载域名列表失败', { description: e instanceof Error ? e.message : String(e) })
+    zonesError.value = e instanceof Error ? e.message : String(e)
+    toast.error('加载域名列表失败', { description: zonesError.value })
   } finally {
     zonesLoading.value = false
   }
 }
 
+/** 请求序号：切域名/时间范围连发时丢弃后发先至的旧响应 */
+let analyticsSeq = 0
+
 async function loadAnalytics() {
   if (!selectedZoneId.value) return
+  const seq = ++analyticsSeq
   loading.value = true
   errorMsg.value = ''
   points.value = []
@@ -96,20 +105,37 @@ async function loadAnalytics() {
       zoneTraffic(selectedZoneId.value, since, until),
       zoneTopCountries(selectedZoneId.value, since, until, 8).catch(() => null),
     ])
+    if (seq !== analyticsSeq) return
     points.value = traffic.points
     summary.value = traffic.summary
     if (topCountries) countries.value = topCountries.rows
   } catch (e) {
+    if (seq !== analyticsSeq) return
     errorMsg.value = e instanceof Error ? e.message : String(e)
     toast.error('加载分析数据失败', { description: errorMsg.value })
   } finally {
-    loading.value = false
+    if (seq === analyticsSeq) loading.value = false
   }
 }
 
-onMounted(async () => {
-  await loadZones()
-  if (selectedZoneId.value) await loadAnalytics()
+/* ---------- 主题响应 ---------- */
+
+/** 主题切换（html 的 class/attribute 变化）时 bump，驱动图表 computed 重取 CSS 变量配色 */
+const themeVersion = ref(0)
+let themeObserver: MutationObserver | null = null
+
+onMounted(() => {
+  // loadZones 设置 selectedZoneId 后由下方 watch 触发 loadAnalytics，首屏只发一组请求
+  loadZones()
+  themeObserver = new MutationObserver(() => {
+    themeVersion.value++
+  })
+  themeObserver.observe(document.documentElement, { attributes: true })
+})
+
+onUnmounted(() => {
+  themeObserver?.disconnect()
+  themeObserver = null
 })
 
 watch([selectedZoneId, range], () => {
@@ -189,6 +215,8 @@ function fmtAxis(n: number): string {
 
 /** 请求趋势图：双轴面积/折线（请求 + 流量），暗色适配 */
 const trendOption = computed(() => {
+  // 依赖 themeVersion：主题切换后重新取 CSS 变量，图表配色跟随更新
+  void themeVersion.value
   const colorPrimary = cssVar('--chart-1', '#5b8ff9')
   const colorMuted = cssVar('--muted-foreground', '#999')
   const colorBorder = cssVar('--border', '#eee')
@@ -201,8 +229,10 @@ const trendOption = computed(() => {
       textStyle: { color: cssVar('--popover-foreground', '#333'), fontSize: 12 },
       // 关闭 axisPointer 触发的 emphasis 淡出（showSymbol:false 时已知 bug，hover 点会消失）
       axisPointer: { type: 'line', triggerEmphasis: false },
-      formatter: (params: Array<{ data: TimePoint }>) => {
-        const p = params[0]?.data as unknown as TimePoint | undefined
+      // series.data 只放数值（对象展开会让 label 等字段被 ECharts 当成保留配置），
+      // 这里用 dataIndex 回查 points 取原始数据
+      formatter: (params: Array<{ dataIndex: number }>) => {
+        const p = points.value[params[0]?.dataIndex ?? -1]
         if (!p) return ''
         return `<div style="font-weight:600">${p.label}</div>
           <div>请求 ${fmtNum(p.requests)}</div>
@@ -236,8 +266,8 @@ const trendOption = computed(() => {
         type: 'line',
         smooth: true,
         showSymbol: false,
-        // data 用对象数组：value 为 Y 值，其余字段供 tooltip formatter 读取
-        data: points.value.map((p) => ({ value: p.requests, ...p })),
+        // data 只放数值：tooltip 通过 dataIndex 回查 points，避免展开对象踩 ECharts 保留字段（label 等）
+        data: points.value.map((p) => p.requests),
         lineStyle: { color: colorPrimary, width: 2 },
         itemStyle: { color: colorPrimary },
         // 彻底禁用 emphasis 态（showSymbol:false hover 点消失为 ECharts 已知 bug，
@@ -260,6 +290,8 @@ const trendOption = computed(() => {
 
 /** 国家分布：横向柱状图 */
 const countryOption = computed(() => {
+  // 依赖 themeVersion：主题切换后重新取 CSS 变量，图表配色跟随更新
+  void themeVersion.value
   const colorPrimary = cssVar('--chart-1', '#5b8ff9')
   const colorMuted = cssVar('--muted-foreground', '#999')
   const colorBorder = cssVar('--border', '#eee')
@@ -272,8 +304,9 @@ const countryOption = computed(() => {
       backgroundColor: cssVar('--popover', '#fff'),
       borderColor: colorBorder,
       textStyle: { color: cssVar('--popover-foreground', '#333'), fontSize: 12 },
-      formatter: (params: Array<{ data: CountryRow }>) => {
-        const c = params[0]?.data as unknown as CountryRow | undefined
+      // series.data 只放数值，tooltip 用 dataIndex 回查 rows 取原始数据
+      formatter: (params: Array<{ dataIndex: number }>) => {
+        const c = rows[params[0]?.dataIndex ?? -1]
         if (!c) return ''
         return `<div style="font-weight:600">${c.country || 'Unknown'}</div>
           <div>请求 ${fmtNum(c.requests)}</div>
@@ -298,7 +331,7 @@ const countryOption = computed(() => {
     series: [
       {
         type: 'bar',
-        data: rows.map((c) => ({ value: c.requests, ...c })),
+        data: rows.map((c) => c.requests),
         itemStyle: {
           color: colorPrimary,
           borderRadius: [0, 4, 4, 0],
@@ -367,6 +400,21 @@ const countryOption = computed(() => {
     <div v-if="zonesLoading" class="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
       <Skeleton v-for="i in 5" :key="i" class="h-24 rounded-xl" />
     </div>
+
+    <!-- 域名列表加载失败（区别于「还没有域名」空态） -->
+    <Card v-else-if="zonesError">
+      <CardContent class="flex flex-col items-center justify-center gap-3 py-12 text-center">
+        <ShieldAlert class="size-8 text-destructive" />
+        <div>
+          <p class="text-sm font-medium">加载域名列表失败</p>
+          <p class="mt-1 text-sm text-muted-foreground">{{ zonesError }}</p>
+        </div>
+        <Button variant="outline" size="sm" @click="loadZones">
+          <RefreshCw class="size-4" />
+          重试
+        </Button>
+      </CardContent>
+    </Card>
 
     <!-- 无域名 -->
     <Card v-else-if="!zones.length">

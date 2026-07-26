@@ -15,7 +15,7 @@ const auth = useAuthStore()
           <Cloud class="size-5" />
         </div>
         <div>
-          <h1 class="text-xl font-semibold tracking-tight">欢迎回来，{{ auth.currentAccount?.accountName ?? '笨蛋' }}</h1>
+          <h1 class="text-xl font-semibold tracking-tight">欢迎回来，{{ auth.currentAccount?.accountName ?? '访客' }}</h1>
           <p class="text-sm text-muted-foreground">
             {{ auth.currentAccount?.authType === 'token' ? 'API Token 模式' : 'Global API Key 模式' }}
             · 账号 ID {{ auth.currentAccount?.accountId }}

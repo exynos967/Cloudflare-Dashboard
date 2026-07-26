@@ -130,7 +130,7 @@ function fmtDayLabel(date: string): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 }
 
-/** 将 ISO8601 时间戳截成 1d 分组所需的纯日期 'YYYY-MM-DD'（CF GraphQL date_geq/date_lt 要求此格式） */
+/** 将 ISO8601 时间戳截成 1d 分组所需的纯日期 'YYYY-MM-DD'（CF GraphQL date_geq/date_leq 要求此格式） */
 function toDateOnly(iso: string): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
@@ -195,7 +195,7 @@ export async function zoneTraffic(
     zones(filter: {zoneTag: ${JSON.stringify(zoneId)}}) {
       httpRequests1dGroups(
         limit: 1000
-        filter: {date_geq: ${JSON.stringify(toDateOnly(since))}, date_lt: ${JSON.stringify(toDateOnly(until))}}
+        filter: {date_geq: ${JSON.stringify(toDateOnly(since))}, date_leq: ${JSON.stringify(toDateOnly(until))}}
         orderBy: [date_ASC]
       ) {
         sum {
@@ -204,6 +204,7 @@ export async function zoneTraffic(
           threats
           pageViews
           cachedBytes
+          cachedRequests
         }
         uniq {
           uniques
@@ -250,6 +251,7 @@ export async function zoneTraffic(
           threats
           pageViews
           cachedBytes
+          cachedRequests
         }
         uniq {
           uniques
@@ -299,7 +301,7 @@ export async function zoneSummary(
     zones(filter: {zoneTag: ${JSON.stringify(zoneId)}}) {
       httpRequests1dGroups(
         limit: 1000
-        filter: {date_geq: ${JSON.stringify(toDateOnly(since))}, date_lt: ${JSON.stringify(toDateOnly(until))}}
+        filter: {date_geq: ${JSON.stringify(toDateOnly(since))}, date_leq: ${JSON.stringify(toDateOnly(until))}}
         orderBy: [date_ASC]
       ) {
         sum {
@@ -349,12 +351,14 @@ export async function zoneTopCountries(
   const start = new Date(end.getTime() - 24 * 60 * 60 * 1000)
   const startIso = start.toISOString()
   const endIso = end.toISOString()
+  // limit 参与 GraphQL 字符串插值，消毒为正整数，防止异常入参破坏查询
+  const safeLimit = Math.max(1, Math.floor(Number(limit)) || 8)
 
   const query = `{
   viewer {
     zones(filter: {zoneTag: ${JSON.stringify(zoneId)}}) {
       httpRequestsAdaptiveGroups(
-        limit: ${limit}
+        limit: ${safeLimit}
         filter: {datetime_gt: ${JSON.stringify(startIso)}, datetime_lt: ${JSON.stringify(endIso)}}
         orderBy: [count_DESC]
       ) {
@@ -388,7 +392,7 @@ export async function zoneTopCountries(
     }
   }
   return {
-    rows: [...merged.values()].sort((a, b) => b.requests - a.requests).slice(0, limit),
+    rows: [...merged.values()].sort((a, b) => b.requests - a.requests).slice(0, safeLimit),
     total,
   }
 }
