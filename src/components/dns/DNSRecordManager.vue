@@ -44,7 +44,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-import { dnsApi, workersApi, pagesApi } from '@/api'
+import { dnsApi, workersApi, pagesApi, listAll } from '@/api'
 import type { DNSRecord, DNSRecordPayload, DNSRecordType } from '@/types/cloudflare'
 
 const props = defineProps<{ zoneId: string; zoneName?: string }>()
@@ -92,7 +92,8 @@ const loading = ref(false)
 async function load() {
   loading.value = true
   try {
-    records.value = await dnsApi.list(props.zoneId, { per_page: 1000 })
+    // 自动翻页拉全量，避免超过单页上限的记录被截断
+    records.value = await listAll<DNSRecord>(`/zones/${props.zoneId}/dns_records`, {}, { perPage: 1000 })
   } catch (e) {
     toast.error('加载 DNS 记录失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
@@ -134,6 +135,11 @@ const pageItems = computed(() => {
 
 watch([typeFilter, proxiedFilter, keyword], () => {
   page.value = 1
+})
+
+// 记录变少（删除/过滤）后总页数缩小时，防止当前页码越界导致误显示「暂无记录」
+watch(totalPages, (t) => {
+  if (page.value > Math.max(1, t)) page.value = Math.max(1, t)
 })
 
 function gotoPage(n: number) {
@@ -245,6 +251,16 @@ function buildPayload(): DNSRecordPayload[] {
 async function submit() {
   if (!form.value.content.trim()) {
     toast.error('请填写记录内容')
+    return
+  }
+  // MX/SRV 必须提供优先级（v-model.number 清空后值为 ''，一并拦截）
+  if (showPriority.value && (form.value.priority == null || String(form.value.priority).trim() === '')) {
+    toast.error('请填写优先级', { description: `${form.value.type} 记录必须提供优先级（priority）` })
+    return
+  }
+  // 编辑模式是对单条记录的更新，不支持多值拆分（新建模式保留多值行为）
+  if (editing.value && splitContent(form.value.content.trim(), form.value.type).length > 1) {
+    toast.error('编辑模式不支持一次输入多个值', { description: '如需多条记录，请分别创建' })
     return
   }
   submitting.value = true
@@ -481,7 +497,7 @@ function typeClass(type: DNSRecordType): string {
           刷新
         </Button>
         <Button variant="outline" size="sm" :disabled="importing" @click="pickFile">
-          <component :is="importing ? Loader2 : Upload" class="size-4" />
+          <component :is="importing ? Loader2 : Upload" class="size-4" :class="{ 'animate-spin': importing }" />
           批量导入
         </Button>
         <input
@@ -665,7 +681,11 @@ function typeClass(type: DNSRecordType): string {
               </p>
               <p v-else class="text-xs text-muted-foreground">开启后流量经 Cloudflare 代理</p>
             </div>
-            <Switch v-model:checked="form.proxied" :disabled="!proxiedEditable" />
+            <Switch
+              :model-value="form.proxied"
+              :disabled="!proxiedEditable"
+              @update:model-value="(v: boolean) => (form.proxied = v)"
+            />
           </div>
 
           <div class="grid grid-cols-2 gap-3">

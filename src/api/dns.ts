@@ -11,8 +11,9 @@ export const dnsApi = {
   create: (zoneId: string, payload: DNSRecordPayload) =>
     http.post<DNSRecord>(`/zones/${zoneId}/dns_records`, { body: payload }),
 
+  /** 部分更新：PATCH 仅提交变化字段（PUT 为全量覆盖，缺字段会 400） */
   update: (zoneId: string, recordId: string, payload: Partial<DNSRecordPayload>) =>
-    http.put<DNSRecord>(`/zones/${zoneId}/dns_records/${recordId}`, { body: payload }),
+    http.patch<DNSRecord>(`/zones/${zoneId}/dns_records/${recordId}`, { body: payload }),
 
   delete: (zoneId: string, recordId: string) =>
     http.delete<DNSRecord>(`/zones/${zoneId}/dns_records/${recordId}`),
