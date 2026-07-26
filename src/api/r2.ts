@@ -28,10 +28,10 @@ export const r2Api = {
     return res?.buckets ?? []
   },
 
-  /** 创建桶 */
+  /** 创建桶（'auto' 不是 API 合法枚举，locationHint 为空或 'auto' 时省略该字段） */
   createBucket: (name: string, locationHint?: R2Location) =>
     http.post<R2Bucket>(`/accounts/${accountId()}/r2/buckets`, {
-      body: { name, locationHint: locationHint ?? 'auto' },
+      body: locationHint && locationHint !== 'auto' ? { name, locationHint } : { name },
     }),
 
   /** 删除桶 */

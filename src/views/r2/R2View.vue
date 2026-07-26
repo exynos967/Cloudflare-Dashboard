@@ -40,7 +40,8 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { Badge } from '@/components/ui/badge'
 
-const NAME_RE = /^[a-z0-9][a-z0-9-]*$/
+// CF 桶名规则：3-63 字符，仅小写字母/数字/连字符，且不能以连字符开头或结尾
+const NAME_RE = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/
 
 const LOCATION_OPTIONS: { value: R2Location; label: string }[] = [
   { value: 'auto', label: '自动（auto）' },
@@ -67,7 +68,8 @@ const createLocation = ref<R2Location>('auto')
 const creating = ref(false)
 const nameError = computed(() => {
   if (!createName.value) return ''
-  if (!NAME_RE.test(createName.value)) return '仅支持小写字母、数字、连字符'
+  if (createName.value.length < 3 || createName.value.length > 63) return '桶名长度需为 3-63 个字符'
+  if (!NAME_RE.test(createName.value)) return '仅支持小写字母、数字、连字符，且不能以连字符开头或结尾'
   return ''
 })
 
@@ -91,15 +93,22 @@ async function loadBuckets() {
   }
 }
 
+// 请求序号守卫：快速切换桶时，丢弃旧桶迟到的 listObjects 响应
+let objSeq = 0
+
 async function loadObjects() {
   if (!currentBucket.value) return
+  const seq = ++objSeq
   loadingObjects.value = true
   try {
-    objects.value = await r2Api.listObjects(currentBucket.value)
+    const list = await r2Api.listObjects(currentBucket.value)
+    if (seq !== objSeq) return
+    objects.value = list
   } catch (e) {
+    if (seq !== objSeq) return
     toast.error('加载对象列表失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
-    loadingObjects.value = false
+    if (seq === objSeq) loadingObjects.value = false
   }
 }
 
@@ -112,6 +121,7 @@ function openBucket(name: string) {
 }
 
 function backToBuckets() {
+  objSeq++ // 使在途的对象列表请求失效
   currentBucket.value = null
   objects.value = []
   loadBuckets()
@@ -160,7 +170,7 @@ async function doDeleteObject() {
   if (!deleteObjectTarget.value || !currentBucket.value) return
   deleting.value = true
   try {
-    await r2Api.deleteObject(currentBucket.value, deleteObjectTarget.value.name)
+    await r2Api.deleteObject(currentBucket.value, deleteObjectTarget.value.key)
     toast.success('已删除对象')
     deleteObjectTarget.value = null
     await loadObjects()
@@ -196,11 +206,11 @@ async function onFileChange(e: Event) {
 async function downloadObject(obj: R2Object) {
   if (!currentBucket.value) return
   try {
-    const blob = await r2Api.getObject(currentBucket.value, obj.name)
+    const blob = await r2Api.getObject(currentBucket.value, obj.key)
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = obj.name.split('/').pop() || obj.name
+    a.download = obj.key.split('/').pop() || obj.key
     document.body.appendChild(a)
     a.click()
     a.remove()
@@ -363,10 +373,10 @@ function locationLabel(loc: R2Location): string {
               <tbody>
                 <tr
                   v-for="o in objects"
-                  :key="o.name"
+                  :key="o.key"
                   class="border-b last:border-0 hover:bg-muted/40"
                 >
-                  <td class="max-w-[280px] truncate px-4 py-3 font-mono text-xs">{{ o.name }}</td>
+                  <td class="max-w-[280px] truncate px-4 py-3 font-mono text-xs">{{ o.key }}</td>
                   <td class="px-4 py-3">{{ fmtSize(o.size) }}</td>
                   <td class="max-w-[160px] truncate px-4 py-3 font-mono text-xs text-muted-foreground">{{ o.etag }}</td>
                   <td class="px-4 py-3 text-muted-foreground">{{ fmtDate(o.last_modified) }}</td>
@@ -411,7 +421,7 @@ function locationLabel(loc: R2Location): string {
               autocomplete="off"
             />
             <p class="text-xs" :class="nameError ? 'text-destructive' : 'text-muted-foreground'">
-              {{ nameError || '小写字母/数字开头，仅含小写字母、数字、连字符' }}
+              {{ nameError || '3-63 个字符，仅含小写字母、数字、连字符，不能以连字符开头或结尾' }}
             </p>
           </div>
           <div class="space-y-1.5">
@@ -462,7 +472,7 @@ function locationLabel(loc: R2Location): string {
         <DialogHeader>
           <DialogTitle>删除对象</DialogTitle>
           <DialogDescription>
-            确定删除对象 <code class="rounded bg-muted px-1 font-mono">{{ deleteObjectTarget?.name }}</code>？该操作不可撤销。
+            确定删除对象 <code class="rounded bg-muted px-1 font-mono">{{ deleteObjectTarget?.key }}</code>？该操作不可撤销。
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
