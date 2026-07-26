@@ -54,33 +54,40 @@ const props = defineProps<{ zoneId: string; zoneName?: string }>()
 /**
  * Worker Custom Domain 与 Pages 自定义域名都强制 proxied=true，CF 不允许关闭。
  * 这些记录 CF 不一定返回 locked=true，故额外拉账号维度的绑定 hostname 列表精确识别。
- * 拉取失败降级为空集合，靠 toggleProxied 的 try/catch 兜底。
+ * 任一来源拉取失败置 bindDetectFailed，工具栏显示警示（识别降级可见）。
  */
 const boundHostnames = ref<Set<string>>(new Set())
+const bindDetectFailed = ref(false)
 
 function normalizeHost(s: string): string {
   return s.replace(/\.$/, '').toLowerCase().trim()
 }
 
 async function loadBoundHostnames() {
-  try {
-    const [workerDomains, pagesProjects] = await Promise.all([
-      workersApi.listDomains().catch(() => []),
-      pagesApi.listProjects().catch(() => []),
-    ])
-    const set = new Set<string>()
-    for (const d of workerDomains) if (d.hostname) set.add(normalizeHost(d.hostname))
-    for (const p of pagesProjects) for (const dm of p.domains ?? []) set.add(normalizeHost(dm))
-    boundHostnames.value = set
-  } catch {
-    boundHostnames.value = new Set()
+  bindDetectFailed.value = false
+  const [workerRes, pagesRes] = await Promise.allSettled([
+    workersApi.listDomains(),
+    pagesApi.listProjects(),
+  ])
+  const set = new Set<string>()
+  if (workerRes.status === 'fulfilled') {
+    for (const d of workerRes.value) if (d.hostname) set.add(normalizeHost(d.hostname))
+  } else {
+    bindDetectFailed.value = true
   }
+  if (pagesRes.status === 'fulfilled') {
+    for (const p of pagesRes.value) for (const dm of p.domains ?? []) set.add(normalizeHost(dm))
+  } else {
+    bindDetectFailed.value = true
+  }
+  boundHostnames.value = set
 }
 
 onMounted(loadBoundHostnames)
 
-/** 该记录是否为 Worker/Pages 绑定的强制代理域名 */
+/** 该记录是否为 Worker/Pages 绑定的强制代理域名（仅 A/AAAA/CNAME 参与判定，避免 apex 同名 MX/TXT 被误锁） */
 function isBoundRecord(rec: DNSRecord): boolean {
+  if (!['A', 'AAAA', 'CNAME'].includes(rec.type)) return false
   return boundHostnames.value.has(normalizeHost(rec.name))
 }
 
@@ -158,6 +165,9 @@ function isProxiableType(t: DNSRecordType): boolean {
   return PROXIABLE_TYPES.includes(t)
 }
 
+/** CF 要求以 data 对象提交的结构化类型（content 为只读展示字段，提交 content 必失败） */
+const DATA_TYPES: DNSRecordType[] = ['SRV', 'CAA', 'TLSA']
+
 interface FormState {
   type: DNSRecordType
   name: string
@@ -166,6 +176,11 @@ interface FormState {
   ttl: number
   proxied: boolean
   priority: number | undefined
+  comment: string
+  /** 结构化子字段：数字用 number | ''（v-model.number 清空后为 ''） */
+  srv: { priority: number | ''; weight: number | ''; port: number | ''; target: string }
+  caa: { flags: number | ''; tag: string; value: string }
+  tlsa: { usage: number | ''; selector: number | ''; matching_type: number | ''; certificate: string }
 }
 
 function blankForm(): FormState {
@@ -175,8 +190,13 @@ function blankForm(): FormState {
     content: '',
     ttlMode: 'auto',
     ttl: 600,
-    proxied: false,
+    // 与 CF 官方 dashboard 一致：可代理类型新建默认开启小黄云（默认类型 A 可代理）
+    proxied: true,
     priority: undefined,
+    comment: '',
+    srv: { priority: '', weight: '', port: '', target: '' },
+    caa: { flags: 0, tag: 'issue', value: '' },
+    tlsa: { usage: '', selector: '', matching_type: '', certificate: '' },
   }
 }
 
@@ -185,7 +205,25 @@ const editing = ref<DNSRecord | null>(null)
 const submitting = ref(false)
 const form = ref<FormState>(blankForm())
 
-const showPriority = computed(() => form.value.type === 'MX' || form.value.type === 'SRV')
+/** SRV 优先级已并入结构化子字段，顶层优先级仅 MX 需要 */
+const showPriority = computed(() => form.value.type === 'MX')
+const isDataType = computed(() => DATA_TYPES.includes(form.value.type))
+
+const namePlaceholder = computed(() =>
+  form.value.type === 'SRV' ? '_service._proto.name，如 _sip._tcp' : '如 @ / www / api（留空为 @）',
+)
+
+const contentPlaceholder = computed(() => {
+  switch (form.value.type) {
+    case 'A': return '1.2.3.4（多个用空格或逗号分隔）'
+    case 'AAAA': return '2001:db8::1（多个用空格或逗号分隔）'
+    case 'CNAME': return '目标主机名，如 target.example.com'
+    case 'MX': return '邮件服务器主机名，如 mail.example.com'
+    case 'NS': return '名称服务器，如 ns1.example.com'
+    case 'TXT': return '文本内容，如 v=spf1 include:_spf.example.com ~all'
+    default: return '记录值'
+  }
+})
 
 /** 小黄云是否可编辑：类型支持代理 且 当前编辑的记录未被 CF 锁定 / 非 Worker·Pages 绑定 */
 const proxiedEditable = computed(() => {
@@ -209,35 +247,136 @@ function openCreate() {
   sheetOpen.value = true
 }
 
+/** data 缺失时从 content 尽力解析结构化字段（解析失败返回 null，由调用方提示重填） */
+function parseDataFromContent(rec: DNSRecord): Record<string, unknown> | null {
+  const parts = rec.content.trim().split(/\s+/)
+  const nums = parts.map(Number)
+  if (rec.type === 'SRV') {
+    // 形如 "priority weight port target" 或 "weight port target"（priority 在顶层字段）
+    if (parts.length === 4 && nums.slice(0, 3).every(Number.isInteger)) {
+      return { priority: nums[0], weight: nums[1], port: nums[2], target: parts[3] }
+    }
+    if (parts.length === 3 && nums.slice(0, 2).every(Number.isInteger) && rec.priority != null) {
+      return { priority: rec.priority, weight: nums[0], port: nums[1], target: parts[2] }
+    }
+    return null
+  }
+  if (rec.type === 'CAA') {
+    // 形如 '0 issue "ca.example.com"'
+    if (parts.length >= 3 && Number.isInteger(nums[0])) {
+      return { flags: nums[0], tag: parts[1], value: parts.slice(2).join(' ').replace(/^"|"$/g, '') }
+    }
+    return null
+  }
+  if (rec.type === 'TLSA') {
+    // 形如 "3 1 1 abcdef..."
+    if (parts.length >= 4 && nums.slice(0, 3).every(Number.isInteger)) {
+      return { usage: nums[0], selector: nums[1], matching_type: nums[2], certificate: parts.slice(3).join('') }
+    }
+    return null
+  }
+  return null
+}
+
+/** 将 data 对象回填到结构化子字段 */
+function fillDataForm(f: FormState, type: DNSRecordType, data: Record<string, unknown>) {
+  const num = (v: unknown): number | '' => (typeof v === 'number' && Number.isFinite(v) ? v : '')
+  const str = (v: unknown): string => (v == null ? '' : String(v))
+  if (type === 'SRV') {
+    f.srv = { priority: num(data.priority), weight: num(data.weight), port: num(data.port), target: str(data.target) }
+  } else if (type === 'CAA') {
+    const tag = str(data.tag)
+    f.caa = { flags: num(data.flags), tag: ['issue', 'issuewild', 'iodef'].includes(tag) ? tag : 'issue', value: str(data.value) }
+  } else if (type === 'TLSA') {
+    f.tlsa = { usage: num(data.usage), selector: num(data.selector), matching_type: num(data.matching_type), certificate: str(data.certificate) }
+  }
+}
+
 function openEdit(rec: DNSRecord) {
   editing.value = rec
-  form.value = {
-    type: rec.type,
-    name: rec.name,
-    content: rec.content,
-    ttlMode: rec.ttl === 1 ? 'auto' : 'custom',
-    ttl: rec.ttl === 1 ? 600 : rec.ttl,
-    proxied: rec.proxied,
-    priority: rec.priority,
+  const f = blankForm()
+  f.type = rec.type
+  f.name = rec.name
+  f.content = rec.content
+  f.ttlMode = rec.ttl === 1 ? 'auto' : 'custom'
+  f.ttl = rec.ttl === 1 ? 600 : rec.ttl
+  f.proxied = rec.proxied
+  f.priority = rec.priority
+  f.comment = rec.comment ?? ''
+  if (DATA_TYPES.includes(rec.type)) {
+    const data = rec.data ?? parseDataFromContent(rec)
+    if (data) fillDataForm(f, rec.type, data)
+    else toast.info('未能解析原记录的结构化数据，请重新填写各子字段')
   }
+  form.value = f
   sheetOpen.value = true
 }
 
-/** A/AAAA 支持单条多 IP（空格 / 逗号分隔） */
+/** A/AAAA 支持单条多 IP（空格 / 逗号分隔）；其余单值类型仅去首尾空白（TXT 保留内部空格） */
 function splitContent(content: string, type: DNSRecordType): string[] {
-  if (type !== 'A' && type !== 'AAAA') return [content]
+  if (type !== 'A' && type !== 'AAAA') return [content.trim()]
   return content
     .split(/[\s,]+/)
     .map((s) => s.trim())
     .filter(Boolean)
 }
 
+/** 整数范围校验（v-model.number 清空为 ''，一并拦截） */
+function intInRange(v: unknown, min: number, max: number): boolean {
+  return typeof v === 'number' && Number.isInteger(v) && v >= min && v <= max
+}
+
+/** 结构化子字段校验，返回错误描述（null 为通过） */
+function validateDataFields(): string | null {
+  const t = form.value.type
+  if (t === 'SRV') {
+    const { priority, weight, port, target } = form.value.srv
+    if (!intInRange(priority, 0, 65535)) return '优先级需为 0-65535 的整数'
+    if (!intInRange(weight, 0, 65535)) return '权重需为 0-65535 的整数'
+    if (!intInRange(port, 0, 65535)) return '端口需为 0-65535 的整数'
+    if (!target.trim()) return '请填写目标（target）'
+  } else if (t === 'CAA') {
+    const { flags, value } = form.value.caa
+    if (!intInRange(flags, 0, 255)) return 'flags 需为 0-255 的整数'
+    if (!value.trim()) return '请填写 value'
+  } else if (t === 'TLSA') {
+    const { usage, selector, matching_type, certificate } = form.value.tlsa
+    if (!intInRange(usage, 0, 3)) return 'usage 需为 0-3 的整数'
+    if (!intInRange(selector, 0, 1)) return 'selector 需为 0-1 的整数'
+    if (!intInRange(matching_type, 0, 2)) return 'matching_type 需为 0-2 的整数'
+    const cert = certificate.replace(/\s+/g, '')
+    if (!cert || !/^[0-9a-fA-F]+$/.test(cert)) return 'certificate 需为十六进制字符串'
+  }
+  return null
+}
+
+/** 从结构化子字段构造 data 对象（调用前需通过 validateDataFields） */
+function buildData(): Record<string, unknown> {
+  const t = form.value.type
+  if (t === 'SRV') {
+    const { priority, weight, port, target } = form.value.srv
+    return { priority, weight, port, target: target.trim() }
+  }
+  if (t === 'CAA') {
+    const { flags, tag, value } = form.value.caa
+    return { flags, tag, value: value.trim() }
+  }
+  const { usage, selector, matching_type, certificate } = form.value.tlsa
+  return { usage, selector, matching_type, certificate: certificate.replace(/\s+/g, '').toLowerCase() }
+}
+
 function buildPayload(): DNSRecordPayload[] {
   const base: Omit<DNSRecordPayload, 'content'> = {
     type: form.value.type,
     name: form.value.name.trim() || '@',
-    ttl: form.value.ttlMode === 'auto' ? 1 : form.value.ttl,
+    // 代理开启时 CF 强制 TTL 自动（1），忽略自定义值
+    ttl: form.value.proxied ? 1 : form.value.ttlMode === 'auto' ? 1 : form.value.ttl,
   }
+  // 备注：编辑时始终提交（清空即删除备注），新建仅非空时提交
+  const comment = form.value.comment.trim()
+  if (editing.value || comment) base.comment = comment
+  // SRV/CAA/TLSA 以 data 对象提交，不发顶层 priority/content
+  if (isDataType.value) return [{ ...base, data: buildData() }]
   // 仅可代理类型且非锁定记录才提交 proxied（CF 对 TXT/MX 等不接受 proxied:true，
   // 锁定记录——如 Worker Custom Domain 绑定——proxied 由 CF 托管不可改，提交会报错）
   const lockedRecord = !!editing.value?.locked || (editing.value ? isBoundRecord(editing.value) : false)
@@ -249,18 +388,32 @@ function buildPayload(): DNSRecordPayload[] {
 }
 
 async function submit() {
-  if (!form.value.content.trim()) {
-    toast.error('请填写记录内容')
-    return
+  if (isDataType.value) {
+    const err = validateDataFields()
+    if (err) {
+      toast.error('字段校验失败', { description: err })
+      return
+    }
+  } else {
+    if (!form.value.content.trim()) {
+      toast.error('请填写记录内容')
+      return
+    }
+    // MX 必须提供有效优先级
+    if (showPriority.value && !intInRange(form.value.priority, 0, 65535)) {
+      toast.error('请填写有效的优先级', { description: 'MX 记录优先级需为 0-65535 的整数' })
+      return
+    }
+    // 编辑模式是对单条记录的更新，不支持多值拆分（新建模式保留多值行为）
+    if (editing.value && splitContent(form.value.content, form.value.type).length > 1) {
+      toast.error('编辑模式不支持一次输入多个值', { description: '如需多条记录，请分别创建' })
+      return
+    }
   }
-  // MX/SRV 必须提供优先级（v-model.number 清空后值为 ''，一并拦截）
-  if (showPriority.value && (form.value.priority == null || String(form.value.priority).trim() === '')) {
-    toast.error('请填写优先级', { description: `${form.value.type} 记录必须提供优先级（priority）` })
-    return
-  }
-  // 编辑模式是对单条记录的更新，不支持多值拆分（新建模式保留多值行为）
-  if (editing.value && splitContent(form.value.content.trim(), form.value.type).length > 1) {
-    toast.error('编辑模式不支持一次输入多个值', { description: '如需多条记录，请分别创建' })
+  // 自定义 TTL 校验（代理开启时 TTL 强制自动，跳过）
+  const ttl = form.value.ttl
+  if (!form.value.proxied && form.value.ttlMode === 'custom' && (typeof ttl !== 'number' || !Number.isInteger(ttl) || ttl < 60)) {
+    toast.error('TTL 无效', { description: '自定义 TTL 需为不小于 60 的整数（秒）' })
     return
   }
   submitting.value = true
@@ -270,24 +423,34 @@ async function submit() {
       if (!payload) throw new Error('记录内容无效')
       await dnsApi.update(props.zoneId, editing.value.id, payload)
       toast.success('DNS 记录已更新')
+      sheetOpen.value = false
+      await load()
     } else {
       const payloads = buildPayload()
-      const results: { ok: boolean; error?: string }[] = []
+      const fails: { value: string; error: string }[] = []
+      let ok = 0
       for (const p of payloads) {
         try {
           await dnsApi.create(props.zoneId, p)
-          results.push({ ok: true })
+          ok++
         } catch (e) {
-          results.push({ ok: false, error: e instanceof Error ? e.message : String(e) })
+          fails.push({
+            value: p.content ?? JSON.stringify(p.data),
+            error: e instanceof Error ? e.message : String(e),
+          })
         }
       }
-      const ok = results.filter((r) => r.ok).length
-      const fail = results.length - ok
-      if (fail === 0) toast.success(`成功创建 ${ok} 条记录`)
-      else toast.error(`成功 ${ok} 失败 ${fail}`, { description: '请查看失败详情' })
+      if (!fails.length) {
+        toast.success(`成功创建 ${ok} 条记录`)
+        sheetOpen.value = false
+      } else {
+        // 部分失败：不关 sheet、保留输入，逐条列出「值：原因」（最多 5 条）
+        toast.error(`成功 ${ok} 条，失败 ${fails.length} 条`, {
+          description: fails.slice(0, 5).map((f) => `${f.value}：${f.error}`).join('\n'),
+        })
+      }
+      await load()
     }
-    sheetOpen.value = false
-    await load()
   } catch (e) {
     toast.error('保存失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
@@ -314,8 +477,9 @@ async function toggleProxied(rec: DNSRecord) {
   }
   togglingId.value = rec.id
   try {
-    await dnsApi.update(props.zoneId, rec.id, { proxied: !rec.proxied })
-    rec.proxied = !rec.proxied
+    // 用 PATCH 响应体整条回写，TTL/modified_on 等同步（CF 代理开启会强制 TTL=1）
+    const updated = await dnsApi.update(props.zoneId, rec.id, { proxied: !rec.proxied })
+    Object.assign(rec, updated)
     toast.success(rec.proxied ? '已开启代理（小黄云）' : '已关闭代理（仅 DNS）')
   } catch (e) {
     toast.error('切换代理失败', { description: e instanceof Error ? e.message : String(e) })
@@ -374,6 +538,16 @@ function pickFile() {
   fileInput.value?.click()
 }
 
+/** 导入预检：必填字段缺失返回错误描述（null 为通过） */
+function validateImportRecord(rec: DNSRecordPayload): string | null {
+  if (typeof rec.type !== 'string' || !rec.type.trim()) return '缺少 type'
+  if (typeof rec.name !== 'string' || !rec.name.trim()) return '缺少 name'
+  const hasContent = typeof rec.content === 'string' && rec.content.trim() !== ''
+  const hasData = rec.data != null && typeof rec.data === 'object'
+  if (!hasContent && !hasData) return '缺少 content 或 data'
+  return null
+}
+
 async function onFileChange(e: Event) {
   const input = e.target as HTMLInputElement
   const file = input.files?.[0]
@@ -389,16 +563,27 @@ async function onFileChange(e: Event) {
       throw new Error('JSON 解析失败，请检查文件格式')
     }
     if (!Array.isArray(arr)) throw new Error('JSON 必须是数组')
-    const records = arr as DNSRecordPayload[]
-    if (!records.length) throw new Error('数组为空')
-    const results = await dnsApi.importBatch(props.zoneId, records)
+    if (!arr.length) throw new Error('数组为空')
+    // 逐条预检：格式错误的不发请求，直接在结果里标注
+    const invalid: { record: DNSRecordPayload; error: string }[] = []
+    const valid: DNSRecordPayload[] = []
+    for (const item of arr) {
+      const rec = (item && typeof item === 'object' ? item : {}) as DNSRecordPayload
+      const err = validateImportRecord(rec)
+      if (err) invalid.push({ record: rec, error: `格式错误：${err}` })
+      else valid.push(rec)
+    }
+    const results = valid.length ? await dnsApi.importBatch(props.zoneId, valid) : []
     const ok = results.filter((r) => r.ok).length
-    const fail = results
-      .filter((r) => !r.ok)
-      .map((r) => ({ record: r.record, error: r.error ?? '未知错误' }))
-    importResult.value = { total: results.length, ok, fail }
+    const fail = [
+      ...invalid,
+      ...results
+        .filter((r) => !r.ok)
+        .map((r) => ({ record: r.record, error: `CF 拒绝：${r.error ?? '未知错误'}` })),
+    ]
+    importResult.value = { total: arr.length, ok, fail }
     importResultOpen.value = true
-    await load()
+    if (valid.length) await load()
   } catch (e) {
     toast.error('导入失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
@@ -434,11 +619,8 @@ function fmtTtl(ttl: number): string {
 }
 
 function fmtDate(s: string): string {
-  try {
-    return new Date(s).toLocaleString('zh-CN', { hour12: false })
-  } catch {
-    return s
-  }
+  const d = new Date(s)
+  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString('zh-CN', { hour12: false })
 }
 
 function typeClass(type: DNSRecordType): string {
@@ -512,6 +694,11 @@ function typeClass(type: DNSRecordType): string {
           添加记录
         </Button>
       </div>
+
+      <!-- 绑定识别降级警示 -->
+      <p v-if="bindDetectFailed" class="w-full text-xs text-amber-600">
+        Worker / Pages 绑定识别不可用，代理开关操作请谨慎
+      </p>
     </div>
 
     <!-- 表格 -->
@@ -559,6 +746,9 @@ function typeClass(type: DNSRecordType): string {
             <div class="truncate text-xs text-muted-foreground" :title="r.name">
               修改于 {{ fmtDate(r.modified_on) }}
             </div>
+            <div v-if="r.comment" class="truncate text-xs text-muted-foreground" :title="r.comment">
+              备注：{{ r.comment }}
+            </div>
           </div>
 
           <div class="flex items-center gap-1">
@@ -594,7 +784,8 @@ function typeClass(type: DNSRecordType): string {
           <span class="text-right text-muted-foreground">{{ fmtTtl(r.ttl) }}</span>
 
           <div class="flex justify-end gap-1">
-            <Button variant="ghost" size="icon-sm" @click="openEdit(r)" title="编辑">
+            <!-- 表单不支持的类型（HTTPS/SVCB/PTR…）隐藏编辑入口，只留删除 -->
+            <Button v-if="FORM_TYPES.includes(r.type)" variant="ghost" size="icon-sm" @click="openEdit(r)" title="编辑">
               <Pencil class="size-3.5" />
             </Button>
             <Button
@@ -639,7 +830,8 @@ function typeClass(type: DNSRecordType): string {
         <div class="space-y-4 px-4">
           <div class="space-y-2">
             <Label>类型</Label>
-            <Select v-model="form.type">
+            <!-- CF 不允许 PATCH 修改 type，编辑时禁用 -->
+            <Select v-model="form.type" :disabled="!!editing">
               <SelectTrigger class="w-full">
                 <SelectValue placeholder="选择记录类型" />
               </SelectTrigger>
@@ -651,15 +843,85 @@ function typeClass(type: DNSRecordType): string {
 
           <div class="space-y-2">
             <Label>名称</Label>
-            <Input v-model="form.name" :placeholder="zoneName ? `如 @ / www / api（留空为 @）` : '如 @ / www / api'" />
-            <p class="text-xs text-muted-foreground">留空使用 @（根域名）。可填子域名前缀或全名。</p>
+            <Input v-model="form.name" :placeholder="namePlaceholder" />
+            <p v-if="form.type === 'SRV'" class="text-xs text-muted-foreground">
+              SRV 名称格式：_service._proto.name（如 _sip._tcp 或 _sip._tcp.www）
+            </p>
+            <p v-else class="text-xs text-muted-foreground">留空使用 @（根域名）。可填子域名前缀或全名。</p>
           </div>
 
-          <div class="space-y-2">
+          <!-- SRV/CAA/TLSA：结构化子字段（CF 要求以 data 对象提交） -->
+          <div v-if="form.type === 'SRV'" class="grid grid-cols-2 gap-3">
+            <div class="space-y-2">
+              <Label>优先级</Label>
+              <Input v-model.number="form.srv.priority" type="number" min="0" max="65535" placeholder="如 10" />
+            </div>
+            <div class="space-y-2">
+              <Label>权重</Label>
+              <Input v-model.number="form.srv.weight" type="number" min="0" max="65535" placeholder="如 5" />
+            </div>
+            <div class="space-y-2">
+              <Label>端口</Label>
+              <Input v-model.number="form.srv.port" type="number" min="0" max="65535" placeholder="如 5060" />
+            </div>
+            <div class="space-y-2">
+              <Label>目标</Label>
+              <Input v-model="form.srv.target" placeholder="target.example.com" />
+            </div>
+          </div>
+
+          <div v-else-if="form.type === 'CAA'" class="space-y-3">
+            <div class="grid grid-cols-2 gap-3">
+              <div class="space-y-2">
+                <Label>flags</Label>
+                <Input v-model.number="form.caa.flags" type="number" min="0" max="255" placeholder="0" />
+              </div>
+              <div class="space-y-2">
+                <Label>tag</Label>
+                <Select v-model="form.caa.tag">
+                  <SelectTrigger class="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="issue">issue</SelectItem>
+                    <SelectItem value="issuewild">issuewild</SelectItem>
+                    <SelectItem value="iodef">iodef</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+            <div class="space-y-2">
+              <Label>value</Label>
+              <Input v-model="form.caa.value" placeholder="如 letsencrypt.org" />
+            </div>
+          </div>
+
+          <div v-else-if="form.type === 'TLSA'" class="space-y-3">
+            <div class="grid grid-cols-3 gap-3">
+              <div class="space-y-2">
+                <Label>usage</Label>
+                <Input v-model.number="form.tlsa.usage" type="number" min="0" max="3" placeholder="0-3" />
+              </div>
+              <div class="space-y-2">
+                <Label>selector</Label>
+                <Input v-model.number="form.tlsa.selector" type="number" min="0" max="1" placeholder="0-1" />
+              </div>
+              <div class="space-y-2">
+                <Label>matching_type</Label>
+                <Input v-model.number="form.tlsa.matching_type" type="number" min="0" max="2" placeholder="0-2" />
+              </div>
+            </div>
+            <div class="space-y-2">
+              <Label>certificate</Label>
+              <Textarea v-model="form.tlsa.certificate" placeholder="证书关联数据（十六进制）" rows="2" />
+            </div>
+          </div>
+
+          <div v-else class="space-y-2">
             <Label>内容</Label>
             <Textarea
               v-model="form.content"
-              :placeholder="form.type === 'A' ? '1.2.3.4（多个用空格或逗号分隔）' : '记录值'"
+              :placeholder="contentPlaceholder"
               rows="2"
             />
           </div>
@@ -688,7 +950,12 @@ function typeClass(type: DNSRecordType): string {
             />
           </div>
 
-          <div class="grid grid-cols-2 gap-3">
+          <!-- 代理开启时 CF 强制 TTL 自动，隐藏自定义选项 -->
+          <div v-if="form.proxied" class="space-y-2">
+            <Label>TTL</Label>
+            <p class="text-xs text-muted-foreground">已代理记录的 TTL 由 Cloudflare 自动管理</p>
+          </div>
+          <div v-else class="grid grid-cols-2 gap-3">
             <div class="space-y-2">
               <Label>TTL</Label>
               <Select v-model="form.ttlMode">
@@ -710,6 +977,11 @@ function typeClass(type: DNSRecordType): string {
           <div v-if="showPriority" class="space-y-2">
             <Label>优先级</Label>
             <Input v-model.number="form.priority" type="number" min="0" placeholder="如 10" />
+          </div>
+
+          <div class="space-y-2">
+            <Label>备注（可选）</Label>
+            <Input v-model="form.comment" placeholder="记录用途说明，仅管理面板可见" />
           </div>
         </div>
 
@@ -761,7 +1033,10 @@ function typeClass(type: DNSRecordType): string {
             :key="i"
             class="rounded-md border border-destructive/30 bg-destructive/5 p-2 text-xs"
           >
-            <div class="font-medium">{{ f.record.type }} · {{ f.record.name }} → {{ f.record.content }}</div>
+            <div class="font-medium">
+              {{ f.record.type ?? '?' }} · {{ f.record.name ?? '?' }} →
+              {{ f.record.content ?? (f.record.data ? JSON.stringify(f.record.data) : '—') }}
+            </div>
             <div class="text-destructive">{{ f.error }}</div>
           </div>
         </div>
