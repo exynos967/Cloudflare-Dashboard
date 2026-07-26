@@ -33,6 +33,7 @@ function reset() {
 }
 
 async function handleSubmit() {
+  if (loading.value) return
   if (authType.value === 'global' && !email.value) return toast.error('请输入 Cloudflare 账号邮箱')
   if (!apiKey.value) return toast.error('请输入 API Key / Token')
   loading.value = true

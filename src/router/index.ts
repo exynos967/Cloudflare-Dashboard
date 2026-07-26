@@ -53,6 +53,8 @@ const routes: RouteRecordRaw[] = [
       { path: 'settings', name: 'settings', component: () => import('@/views/settings/SettingsView.vue'), meta: { title: '设置', icon: Settings, group: '工具', order: 2 } },
     ],
   },
+  // 404 兜底：未知路径统一回概览（未登录时由守卫再转登录页）
+  { path: '/:pathMatch(.*)*', redirect: { name: 'dashboard' } },
 ]
 
 const router = createRouter({
@@ -64,18 +66,23 @@ router.beforeEach(async (to) => {
   const auth = useAuthStore()
   // 凭据从 localStorage 异步解密加载，未就绪前不拦截，避免刷新瞬间误跳登录页
   if (!auth.ready) {
-    // store 初始化在模块加载时已启动，这里等待一次微任务即可就绪
+    // store 初始化在模块加载时已启动，正常几个微任务内就绪；
+    // 超时兜底防止初始化异常导致守卫死等（超时后按未就绪放行，由后续判断转登录页）
     await new Promise<void>((resolve) => {
       if (auth.ready) return resolve()
+      let timer: ReturnType<typeof setTimeout> | undefined
       const stop = watch(
         () => auth.ready,
         (v) => {
-          if (v) {
-            stop()
-            resolve()
-          }
+          if (v) done()
         },
       )
+      function done() {
+        stop()
+        clearTimeout(timer)
+        resolve()
+      }
+      timer = setTimeout(done, 10_000)
     })
   }
   if (!to.meta.public && !auth.isAuthed) {

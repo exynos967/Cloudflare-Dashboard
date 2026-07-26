@@ -16,7 +16,7 @@ import {
   Monitor,
   Loader2,
 } from '@lucide/vue'
-import { useAuthStore } from '@/stores/auth'
+import { useAuthStore, type Account } from '@/stores/auth'
 import { useTheme } from '@/composables/useTheme'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -52,11 +52,26 @@ function formatDate(ts: number): string {
 
 const addOpen = ref(false)
 
-const editing = ref<{ id: string; nickname: string } | null>(null)
+const editing = ref<{
+  id: string
+  nickname: string
+  corrupted: boolean
+  authType: Account['authType']
+  email: string
+} | null>(null)
 const editOpen = ref(false)
+/** corrupted 账号重新录入的 API Key / Token */
+const editKey = ref('')
 
-function startEdit(id: string, nickname: string) {
-  editing.value = { id, nickname }
+function startEdit(acc: Account) {
+  editing.value = {
+    id: acc.id,
+    nickname: acc.nickname,
+    corrupted: !!acc.corrupted,
+    authType: acc.authType,
+    email: acc.email ?? '',
+  }
+  editKey.value = ''
   editOpen.value = true
 }
 
@@ -64,10 +79,23 @@ function saveEdit() {
   if (!editing.value) return
   const nickname = editing.value.nickname.trim()
   if (!nickname) return toast.error('昵称不能为空')
-  auth.updateAccount(editing.value.id, { nickname })
-  toast.success('昵称已更新')
+  const patch: Partial<Account> = { nickname }
+  // global 账号：邮箱始终可编辑并必填。corrupted 重录后旧密文会被丢弃，
+  // 若不带上邮箱，仅 email 解密失败的账号会把 email 落成 undefined 变死号
+  if (editing.value.authType === 'global') {
+    const email = editing.value.email.trim()
+    if (!email) return toast.error('Global API Key 账号必须填写邮箱')
+    patch.email = email
+  }
+  // corrupted 账号：重填了 key 就一并更新（store 内会清除 corrupted 标记）
+  if (editing.value.corrupted) {
+    const key = editKey.value.trim()
+    if (key) patch.apiKey = key
+  }
+  auth.updateAccount(editing.value.id, patch)
+  toast.success('已保存')
+  // 只关对话框，editing 不立即置空：退出动画期间模板仍在渲染，避免空指针
   editOpen.value = false
-  editing.value = null
 }
 
 const deletingId = ref<string | null>(null)
@@ -141,6 +169,9 @@ const stack = ['Vue 3', 'TypeScript', 'Vite', 'shadcn-vue', 'Tailwind CSS v4', '
                 <Badge v-if="acc.id === auth.currentAccountId" variant="outline" class="text-primary">
                   当前
                 </Badge>
+                <Badge v-if="acc.corrupted" variant="destructive">
+                  凭据无法解密，请重新录入
+                </Badge>
               </div>
               <div class="text-sm text-muted-foreground">{{ acc.accountName }} · {{ acc.accountId }}</div>
               <div class="text-xs text-muted-foreground">
@@ -156,7 +187,7 @@ const stack = ['Vue 3', 'TypeScript', 'Vite', 'shadcn-vue', 'Tailwind CSS v4', '
               >
                 设为当前
               </Button>
-              <Button size="icon" variant="ghost" class="size-8" @click="startEdit(acc.id, acc.nickname)">
+              <Button size="icon" variant="ghost" class="size-8" @click="startEdit(acc)">
                 <Pencil class="size-4" />
               </Button>
               <Button
@@ -185,8 +216,8 @@ const stack = ['Vue 3', 'TypeScript', 'Vite', 'shadcn-vue', 'Tailwind CSS v4', '
       <CardContent class="space-y-4">
         <ul class="space-y-2 text-sm text-muted-foreground">
           <li>· 凭据仅保存在浏览器 <code class="rounded bg-muted px-1 py-0.5 text-xs">localStorage</code> 中，不上传任何服务器。</li>
-          <li>· 敏感字段（API Key / 邮箱）已用 <code class="rounded bg-muted px-1 py-0.5 text-xs">AES-GCM-256</code> 加密存储，密钥由设备指纹经 PBKDF2 派生，本地无明文。</li>
-          <li>· 加密可防本地存储被直接读取，但无法防御同源 XSS 运行时窃取已解密凭据，请勿在公共/不可信设备上保存。</li>
+          <li>· 敏感字段（API Key / 邮箱）经本地随机密钥混淆存储（<code class="rounded bg-muted px-1 py-0.5 text-xs">AES-GCM-256</code>），可防止明文被顺手读取；密钥同存于本地，不等同于口令加密。</li>
+          <li>· 混淆无法防御同源 XSS 运行时窃取已解密凭据，请勿在共享/不可信设备上保存凭据。</li>
           <li>· 建议使用最小权限的 API Token，而非 Global API Key。</li>
           <li>· 清除浏览器数据或点击下方按钮即可清除所有凭据。</li>
         </ul>
@@ -272,21 +303,47 @@ const stack = ['Vue 3', 'TypeScript', 'Vite', 'shadcn-vue', 'Tailwind CSS v4', '
     <!-- 添加账号对话框 -->
     <AddAccountDialog v-model:open="addOpen" />
 
-    <!-- 编辑昵称对话框 -->
+    <!-- 编辑账号对话框（editing 用 v-if 保护：关闭动画期间不置空，避免空指针） -->
     <Dialog v-model:open="editOpen">
-      <DialogContent class="sm:max-w-sm">
+      <DialogContent v-if="editing" class="sm:max-w-sm">
         <DialogHeader>
-          <DialogTitle>编辑昵称</DialogTitle>
+          <DialogTitle>编辑账号</DialogTitle>
           <DialogDescription>为该账号设置一个便于识别的本地昵称。</DialogDescription>
         </DialogHeader>
-        <div class="space-y-2 py-2">
-          <Label for="nickname">昵称</Label>
-          <Input
-            id="nickname"
-            v-model="editing!.nickname"
-            placeholder="输入昵称"
-            @keyup.enter="saveEdit"
-          />
+        <div class="space-y-4 py-2">
+          <div class="space-y-2">
+            <Label for="nickname">昵称</Label>
+            <Input
+              id="nickname"
+              v-model="editing.nickname"
+              placeholder="输入昵称"
+              @keyup.enter="saveEdit"
+            />
+          </div>
+          <div v-if="editing.authType === 'global'" class="space-y-2">
+            <Label for="edit-email">账号邮箱</Label>
+            <Input
+              id="edit-email"
+              v-model="editing.email"
+              type="email"
+              placeholder="your@email.com"
+              @keyup.enter="saveEdit"
+            />
+            <p v-if="editing.corrupted" class="text-xs text-muted-foreground">
+              重录凭据时邮箱会一并重新保存，请确认填写正确。
+            </p>
+          </div>
+          <div v-if="editing.corrupted" class="space-y-2">
+            <Label for="rekey">重新录入 API Key / Token</Label>
+            <Input
+              id="rekey"
+              v-model="editKey"
+              type="password"
+              placeholder="••••••••••••"
+              @keyup.enter="saveEdit"
+            />
+            <p class="text-xs text-muted-foreground">该账号的本地凭据已无法解密，请重新填写以恢复使用。</p>
+          </div>
         </div>
         <DialogFooter>
           <Button variant="outline" @click="editOpen = false">取消</Button>

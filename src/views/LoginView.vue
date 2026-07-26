@@ -2,13 +2,14 @@
 import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { toast } from 'vue-sonner'
-import { Cloud, Loader2, KeyRound, Mail } from '@lucide/vue'
-import { useAuthStore } from '@/stores/auth'
+import { Cloud, Loader2, KeyRound, Mail, User } from '@lucide/vue'
+import { useAuthStore, type Account } from '@/stores/auth'
 import { verifyCredentials } from '@/api'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Separator } from '@/components/ui/separator'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 const auth = useAuthStore()
@@ -20,7 +21,25 @@ const email = ref('')
 const apiKey = ref('')
 const loading = ref(false)
 
+/** 账号凭据不可用（密文解密失败或密钥为空）：不允许直接进入 */
+function isBroken(acc: Account): boolean {
+  return !!acc.corrupted || !acc.apiKey
+}
+
+/** 直接使用已有本地账号登录（corrupted 账号拦截并引导重录） */
+function pickAccount(acc: Account) {
+  if (isBroken(acc)) {
+    toast.error('该账号凭据需重新录入', {
+      description: '请先用有效凭据登录，再到「账号设置」为该账号重新录入 API Key / Token',
+    })
+    return
+  }
+  auth.switchAccount(acc.id)
+  router.push((route.query.redirect as string) || '/')
+}
+
 async function handleLogin() {
+  if (loading.value) return
   if (authType.value === 'global' && !email.value) return toast.error('请输入 Cloudflare 账号邮箱')
   if (!apiKey.value) return toast.error('请输入 API Key / Token')
   loading.value = true
@@ -64,6 +83,33 @@ async function handleLogin() {
         <CardDescription>开源 · 自托管 · 凭据零上链的 Cloudflare 管理面板</CardDescription>
       </CardHeader>
       <CardContent class="space-y-4">
+        <!-- 已有本地账号：直接选择登录，避免重复录入累积重复项 -->
+        <template v-if="auth.accounts.length > 0">
+          <div class="space-y-2">
+            <Label>选择已有账号</Label>
+            <Button
+              v-for="acc in auth.accounts"
+              :key="acc.id"
+              variant="outline"
+              class="w-full justify-start gap-2"
+              @click="pickAccount(acc)"
+            >
+              <User class="size-4 text-muted-foreground" />
+              <span class="truncate">{{ acc.nickname || acc.accountName }}</span>
+              <span v-if="isBroken(acc)" class="shrink-0 text-xs text-destructive">凭据需重新录入</span>
+              <span class="ml-auto shrink-0 text-xs text-muted-foreground">
+                {{ acc.authType === 'token' ? 'API Token' : 'Global Key' }}
+              </span>
+            </Button>
+          </div>
+          <div class="relative">
+            <Separator />
+            <span class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-card px-2 text-xs text-muted-foreground">
+              或使用新凭据登录
+            </span>
+          </div>
+        </template>
+
         <Tabs v-model="authType" class="w-full">
           <TabsList class="grid w-full grid-cols-2">
             <TabsTrigger value="global">Global API Key</TabsTrigger>
