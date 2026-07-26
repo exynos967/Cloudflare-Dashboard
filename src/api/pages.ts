@@ -1,4 +1,4 @@
-import { http } from './client'
+import { http, listAll } from './client'
 import { useAuthStore } from '@/stores/auth'
 import type { PagesProject, PagesDeployment } from '@/types/cloudflare'
 
@@ -14,9 +14,9 @@ function projectBase(name: string): string {
 }
 
 export const pagesApi = {
-  /** 列出账号下所有 Pages 项目 */
+  /** 列出账号下所有 Pages 项目（自动翻页） */
   listProjects: () =>
-    http.get<PagesProject[]>(`/accounts/${accountId()}/pages/projects`),
+    listAll<PagesProject>(`/accounts/${accountId()}/pages/projects`),
 
   /** 获取单个 Pages 项目详情 */
   getProject: (name: string) => http.get<PagesProject>(projectBase(name)),
@@ -30,9 +30,9 @@ export const pagesApi = {
   /** 删除 Pages 项目 */
   deleteProject: (name: string) => http.delete<void>(projectBase(name)),
 
-  /** 列出项目下的部署记录 */
+  /** 列出项目下的部署记录（自动翻页） */
   listDeployments: (name: string) =>
-    http.get<PagesDeployment[]>(`${projectBase(name)}/deployments`),
+    listAll<PagesDeployment>(`${projectBase(name)}/deployments`),
 
   /** 获取单个部署详情 */
   getDeployment: (name: string, id: string) =>
