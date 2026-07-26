@@ -10,7 +10,7 @@ import {
   Settings2,
   Trash2,
 } from '@lucide/vue'
-import { tunnelApi, type Tunnel, type TunnelConnection, type IngressRule } from '@/api/tunnel'
+import { tunnelApi, type Tunnel, type TunnelConnection, type IngressRule, type TunnelConfigBody } from '@/api/tunnel'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -88,8 +88,9 @@ async function submitCreate() {
   creating.value = true
   try {
     const t = await tunnelApi.createTunnel(createName.value.trim())
-    createdToken.value = t.token
     createdName.value = t.name
+    // 创建响应不含 token，需单独调 token 端点获取
+    createdToken.value = await tunnelApi.getTunnelToken(t.id)
     toast.success('Tunnel 已创建，请复制 token 配置 cloudflared')
     await load()
   } catch (e) {
@@ -124,12 +125,20 @@ async function viewConnections(t: Tunnel) {
 async function viewConfig(t: Tunnel) {
   cfgTarget.value = t
   cfgLoading.value = true
+  cfgLoadFailed.value = false
   editingRoutes.value = []
+  loadedConfig.value = null
   try {
+    // 从未配置过的隧道返回 null / config 为 null
     const cfg = await tunnelApi.getConfig(t.id)
-    const rules = cfg.config?.ingress?.length ? cfg.config.ingress : [{ service: 'http_status:404' }]
+    loadedConfig.value = cfg?.config ?? null
+    const rules = loadedConfig.value?.ingress?.length
+      ? loadedConfig.value.ingress
+      : [{ service: 'http_status:404' }]
     editingRoutes.value = rules.map(parseService)
   } catch (e) {
+    // 加载失败时禁用编辑与保存，避免用空配置覆盖线上已有配置
+    cfgLoadFailed.value = true
     toast.error('获取配置失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
     cfgLoading.value = false
@@ -147,25 +156,27 @@ interface EditableRoute {
   isCatchAll: boolean
   /** catch-all 原始 service 文本 */
   catchAllService: string
+  /** 原始 ingress 规则对象（新增路由为 null）；保存时仅覆盖 hostname/service，path/originRequest 等字段原样保留 */
+  original: IngressRule | null
 }
 
 const PROTOCOLS = ['http://', 'https://', 'tcp://', 'ssh://', 'unix:', 'http_status:']
 
-/** 把 ingress 规则解析为可编辑态 */
+/** 把 ingress 规则解析为可编辑态（保留原始规则对象，保存时透传未编辑字段） */
 function parseService(r: IngressRule): EditableRoute {
   const hostname = r.hostname ?? ''
   const service = (r.service ?? '').trim()
   if (!hostname) {
     // catch-all（无 hostname）
-    return { hostname: '', protocol: '', address: '', port: '', isCatchAll: true, catchAllService: service }
+    return { hostname: '', protocol: '', address: '', port: '', isCatchAll: true, catchAllService: service, original: r }
   }
   // 尝试解析 协议://地址:端口
   const m = service.match(/^(https?|tcp|ssh):\/\/([^:\/]+)(?::(\d+))?/)
   if (m) {
-    return { hostname, protocol: `${m[1]}://`, address: m[2], port: m[3] ?? '', isCatchAll: false, catchAllService: service }
+    return { hostname, protocol: `${m[1]}://`, address: m[2], port: m[3] ?? '', isCatchAll: false, catchAllService: service, original: r }
   }
   // 解析失败（unix:/http_status: 等非标准），整体塞 address
-  return { hostname, protocol: '', address: service, port: '', isCatchAll: false, catchAllService: service }
+  return { hostname, protocol: '', address: service, port: '', isCatchAll: false, catchAllService: service, original: r }
 }
 
 /** 把可编辑态拼回 service 字符串 */
@@ -179,6 +190,10 @@ function buildService(r: EditableRoute): string {
 
 const editingRoutes = ref<EditableRoute[]>([])
 const cfgSaving = ref(false)
+/** 加载时的原始 config（保存时透传 warp-routing/originRequest 等顶层字段） */
+const loadedConfig = ref<TunnelConfigBody | null>(null)
+/** 配置加载失败时禁用「添加路由/保存」，防止覆盖线上配置 */
+const cfgLoadFailed = ref(false)
 
 function addRoute() {
   const routes = [...editingRoutes.value]
@@ -189,6 +204,7 @@ function addRoute() {
     port: '8080',
     isCatchAll: false,
     catchAllService: '',
+    original: null,
   })
   editingRoutes.value = routes
 }
@@ -219,11 +235,19 @@ async function saveConfig() {
   }
   cfgSaving.value = true
   try {
-    const ingress = editingRoutes.value.map((r) => ({
-      hostname: r.isCatchAll ? undefined : r.hostname.trim(),
-      service: buildService(r),
-    })).filter((r) => r.service)
-    await tunnelApi.putConfig(cfgTarget.value.id, { ingress })
+    // 基于原始规则对象仅覆盖 hostname/service，path/originRequest 等字段原样保留
+    const ingress = editingRoutes.value.map((r) => {
+      const base: IngressRule = r.original ? { ...r.original } : {} as IngressRule
+      if (r.isCatchAll) {
+        delete base.hostname
+      } else {
+        base.hostname = r.hostname.trim()
+      }
+      base.service = buildService(r)
+      return base
+    }).filter((r) => r.service)
+    // 顶层 config 的其他字段（warp-routing、originRequest 等）原样透传
+    await tunnelApi.putConfig(cfgTarget.value.id, { ...(loadedConfig.value ?? {}), ingress })
     toast.success('配置已保存，cloudflared 下次连接即生效')
     await viewConfig(cfgTarget.value)
   } catch (e) {
@@ -354,9 +378,14 @@ function fmtDate(s: string | undefined): string {
       </CardContent>
     </Card>
 
-    <!-- 创建 / 展示 token -->
+    <!-- 创建 / 展示 token（token 仅显示一次：展示阶段禁止 ESC/点击遮罩误关，只能点按钮关闭） -->
     <Dialog v-model:open="createOpen">
-      <DialogContent class="sm:max-w-lg">
+      <DialogContent
+        class="sm:max-w-lg"
+        :show-close-button="!createdToken"
+        @escape-key-down="(e) => { if (createdToken) e.preventDefault() }"
+        @interact-outside="(e) => { if (createdToken) e.preventDefault() }"
+      >
         <DialogHeader>
           <DialogTitle>新建 Tunnel</DialogTitle>
           <DialogDescription>
@@ -536,7 +565,7 @@ function fmtDate(s: string | undefined): string {
                 />
               </div>
             </div>
-            <Button variant="outline" size="sm" class="w-full" @click="addRoute">
+            <Button variant="outline" size="sm" class="w-full" :disabled="cfgLoadFailed" @click="addRoute">
               <Plus class="size-4" />
               添加公开域名路由
             </Button>
@@ -549,7 +578,7 @@ function fmtDate(s: string | undefined): string {
         </div>
         <DialogFooter>
           <Button variant="outline" @click="cfgTarget = null">取消</Button>
-          <Button :disabled="cfgSaving" @click="saveConfig">
+          <Button :disabled="cfgSaving || cfgLoading || cfgLoadFailed" @click="saveConfig">
             {{ cfgSaving ? '保存中…' : '保存配置' }}
           </Button>
         </DialogFooter>

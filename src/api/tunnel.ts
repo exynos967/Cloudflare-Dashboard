@@ -1,4 +1,4 @@
-import { http } from './client'
+import { http, listAll } from './client'
 import { useAuthStore } from '@/stores/auth'
 
 /** 取当前账号的 Cloudflare account id（account 维度调用的前缀） */
@@ -32,8 +32,9 @@ export interface IngressRule {
 export interface TunnelConfigBody {
   ingress: IngressRule[]
   originRequest?: {
-    connectTimeout?: string
-    tlsTimeout?: string
+    /** 超时秒数（官方 SDK 定义为 number） */
+    connectTimeout?: number
+    tlsTimeout?: number
     noTLSVerify?: boolean
     httpHostHeader?: string
   }
@@ -41,7 +42,8 @@ export interface TunnelConfigBody {
 }
 
 export interface TunnelConfig {
-  config: TunnelConfigBody
+  /** 从未配置过的隧道 config 为 null */
+  config: TunnelConfigBody | null
   tunnel_id: string
   version: string
 }
@@ -59,21 +61,20 @@ export interface Tunnel {
   tun_type: string | null
 }
 
-/** 创建 Tunnel 返回（含 token，仅创建时返回一次） */
-export interface TunnelCreated extends Tunnel {
-  /** 创建时一次性返回的连接 token（base64 编码，cloudflared 使用） */
-  token: string
-}
-
 export const tunnelApi = {
-  /** 列出账号下所有 Tunnel */
-  listTunnels: () => http.get<Tunnel[]>(`/accounts/${accountId()}/cfd_tunnel`),
+  /** 列出账号下所有 Tunnel（排除已删除的幽灵隧道，自动翻页） */
+  listTunnels: () =>
+    listAll<Tunnel>(`/accounts/${accountId()}/cfd_tunnel`, { is_deleted: false }),
 
-  /** 创建 Tunnel（CF 自动生成 secret，返回 token 供 cloudflared 连接） */
+  /** 创建 Tunnel（config_src=cloudflare：ingress 配置由云端管理，否则默认 local 不生效） */
   createTunnel: (name: string) =>
-    http.post<TunnelCreated>(`/accounts/${accountId()}/cfd_tunnel`, {
-      body: { name, tunnel_secret: null },
+    http.post<Tunnel>(`/accounts/${accountId()}/cfd_tunnel`, {
+      body: { name, config_src: 'cloudflare' },
     }),
+
+  /** 获取 Tunnel 连接 token（cloudflared run --token 使用，result 即 token 字符串） */
+  getTunnelToken: (tunnelId: string) =>
+    http.get<string>(`/accounts/${accountId()}/cfd_tunnel/${tunnelId}/token`),
 
   /** 删除 Tunnel（需先断开所有 cloudflared 连接） */
   deleteTunnel: (id: string) => http.delete<void>(`/accounts/${accountId()}/cfd_tunnel/${id}`),
@@ -82,9 +83,9 @@ export const tunnelApi = {
   getConnections: (id: string) =>
     http.get<TunnelConnection[]>(`/accounts/${accountId()}/cfd_tunnel/${id}/connections`),
 
-  /** 查看 Tunnel 配置（只读） */
+  /** 查看 Tunnel 配置（从未配置过的隧道返回 null / config 为 null） */
   getConfig: (id: string) =>
-    http.get<TunnelConfig>(`/accounts/${accountId()}/cfd_tunnel/${id}/configurations`),
+    http.get<TunnelConfig | null>(`/accounts/${accountId()}/cfd_tunnel/${id}/configurations`),
 
   /** 写入 Tunnel 配置（ingress 规则等，云端管理） */
   putConfig: (id: string, config: TunnelConfigBody) =>
