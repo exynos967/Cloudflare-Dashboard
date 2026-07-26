@@ -1,4 +1,4 @@
-import { http } from './client'
+import { http, listAll, CFError } from './client'
 import { useAuthStore } from '@/stores/auth'
 
 /* -------------------------------------------------------------------------- */
@@ -58,14 +58,20 @@ export interface FirewallAccessRule {
   modified_on: string
 }
 
-/** 防火墙规则（zone 维度） */
-export interface FirewallRule {
+/** Rulesets API：phase entrypoint 规则集内的单条规则（zone 维度） */
+export interface RulesetRule {
   id: string
   description?: string
+  expression: string
   action: string
-  filter: { expression: string; id?: string }
-  priority?: number
-  paused: boolean
+  enabled: boolean
+  last_updated?: string
+}
+
+/** Rulesets API：phase entrypoint 规则集（只取 rules，其余字段按需扩展） */
+interface RulesetEntrypoint {
+  id: string
+  rules?: RulesetRule[]
 }
 
 /** WAF 规则集（account 维度） */
@@ -85,10 +91,10 @@ export interface PageRuleTarget {
   constraint: { operator: 'matches'; value: string }
 }
 
-/** Page Rule 动作 */
+/** Page Rule 动作（value 因动作而异：枚举字符串 / TTL 整数秒 / forwarding_url 对象） */
 export interface PageRuleAction {
   id: string
-  value?: string
+  value?: string | number | { url: string; status_code: number }
 }
 
 export interface PageRule {
@@ -101,15 +107,6 @@ export interface PageRule {
   modified_on: string
 }
 
-export interface CacheRule {
-  id: string
-  description?: string
-  expression?: string
-  action?: string
-  enabled?: boolean
-  last_updated?: string
-}
-
 /* -------------------------------------------------------------------------- */
 /*                                  API                                        */
 /* -------------------------------------------------------------------------- */
@@ -119,6 +116,22 @@ function accountId(): string {
   const acc = useAuthStore().currentAccount
   if (!acc) throw new Error('未登录')
   return acc.accountId
+}
+
+/**
+ * 读取某 phase 的 entrypoint 规则集内的规则。
+ * zone 从未创建过该 phase entrypoint 时 CF 返回 404，视为空列表；其他错误上抛。
+ */
+async function listPhaseRules(zoneId: string, phase: string): Promise<RulesetRule[]> {
+  try {
+    const ruleset = await http.get<RulesetEntrypoint>(
+      `/zones/${zoneId}/rulesets/phases/${phase}/entrypoint`,
+    )
+    return ruleset.rules ?? []
+  } catch (e) {
+    if (e instanceof CFError && e.status === 404) return []
+    throw e
+  }
 }
 
 export const securityApi = {
@@ -154,8 +167,9 @@ export const securityApi = {
 
   /* --------------------------- WAF / 防火墙 ------------------------------ */
 
+  /** 访问规则默认单页 25 条，用 listAll 自动翻页拉全量 */
   listAccessRules: (zoneId: string) =>
-    http.get<FirewallAccessRule[]>(`/zones/${zoneId}/firewall/access_rules/rules`),
+    listAll<FirewallAccessRule>(`/zones/${zoneId}/firewall/access_rules/rules`),
 
   createAccessRule: (zoneId: string, data: {
     mode: FirewallAccessRule['mode']
@@ -169,8 +183,9 @@ export const securityApi = {
   deleteAccessRule: (zoneId: string, ruleId: string) =>
     http.delete<unknown>(`/zones/${zoneId}/firewall/access_rules/rules/${ruleId}`),
 
+  /** WAF 自定义规则（Rulesets API；旧 Firewall Rules API 已于 2025-06-15 停服） */
   listFirewallRules: (zoneId: string) =>
-    http.get<FirewallRule[]>(`/zones/${zoneId}/firewall/rules`),
+    listPhaseRules(zoneId, 'http_request_firewall_custom'),
 
   listWafRulesets: (accountId: string) =>
     http.get<WafRuleset[]>(`/accounts/${accountId}/rulesets`, {
@@ -195,14 +210,9 @@ export const securityApi = {
   deletePageRule: (zoneId: string, ruleId: string) =>
     http.delete<unknown>(`/zones/${zoneId}/pagerules/${ruleId}`),
 
-  /** cache_rules 可能 404，做容错返回空数组 */
-  listCacheRules: async (zoneId: string): Promise<CacheRule[]> => {
-    try {
-      return await http.get<CacheRule[]>(`/zones/${zoneId}/cache_rules`)
-    } catch {
-      return []
-    }
-  },
+  /** 缓存规则（Rulesets API http_request_cache_settings phase） */
+  listCacheRules: (zoneId: string) =>
+    listPhaseRules(zoneId, 'http_request_cache_settings'),
 }
 
 /* -------------------------------------------------------------------------- */
@@ -225,7 +235,7 @@ export const securityApi = {
  */
 
 /** 配置项的取值类型 */
-export type SettingType = 'onoff' | 'select' | 'number' | 'minify' | 'security_level'
+export type SettingType = 'onoff' | 'select' | 'number' | 'security_level'
 
 /** CF 原生维度：单个配置项的元数据（代码内置，不变） */
 export interface SettingDef {
@@ -304,22 +314,14 @@ export const SETTING_DEFS: SettingDef[] = [
   },
 
   /* 速度 */
-  { id: 'minify', label: '资源压缩', type: 'minify', group: 'speed' },
   { id: 'brotli', label: 'Brotli 压缩', type: 'onoff', group: 'speed' },
   { id: 'early_hints', label: 'Early Hints', type: 'onoff', group: 'speed' },
   { id: 'http3', label: 'HTTP/3 (QUIC)', type: 'onoff', requiresPro: true, group: 'speed' },
   { id: '0rtt', label: '0-RTT 连接恢复', type: 'onoff', group: 'speed' },
 ]
 
-/** minify 类型值的形状 */
-export interface MinifyValue {
-  html: 'on' | 'off'
-  css: 'on' | 'off'
-  js: 'on' | 'off'
-}
-
-/** 单个配置项的值（on/off 字符串、枚举、数字或 minify 对象） */
-export type SettingValue = string | number | MinifyValue | boolean
+/** 单个配置项的值（on/off 字符串、枚举或数字） */
+export type SettingValue = string | number | boolean
 
 /** 按 id 查 SettingDef */
 const SETTING_DEF_MAP: Record<string, SettingDef> = Object.fromEntries(

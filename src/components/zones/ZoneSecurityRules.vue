@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { toast } from 'vue-sonner'
-import { RefreshCw, Loader2, ShieldAlert, Globe, Plus, Trash2, Flame } from '@lucide/vue'
-import { securityApi, currentAccountId } from '@/api'
+import { RefreshCw, Loader2, ShieldAlert, Globe, Plus, Trash2, Flame, Layers } from '@lucide/vue'
+import { securityApi } from '@/api'
 import type {
   CertificatePack,
   CertificatePackCert,
   FirewallAccessRule,
-  WafRuleset,
+  RulesetRule,
   PageRule,
   PageRuleAction,
 } from '@/api'
@@ -90,29 +90,53 @@ function certStatusClass(s: string): string {
   return 'bg-muted text-muted-foreground'
 }
 
-/* ----------------------------- WAF 规则集（账号维度） ----------------------------- */
+/* ----------------------------- WAF 自定义规则（zone 维度） ----------------------------- */
 
-const rulesets = ref<WafRuleset[]>([])
-const rulesetsLoading = ref(false)
+const wafRules = ref<RulesetRule[]>([])
+const wafRulesLoading = ref(false)
 
-async function loadRulesets() {
-  rulesetsLoading.value = true
+async function loadWafRules() {
+  if (!props.zoneId) return
+  wafRulesLoading.value = true
   try {
-    const all = await securityApi.listWafRulesets(currentAccountId())
-    // 只展示 WAF 相关 phase
-    const phases = new Set([
-      'http_request_firewall_custom',
-      'http_request_firewall_managed',
-      'http_request_dynamic_redirect',
-      'http_request_late_transform',
-      'http_request_origin',
-    ])
-    const filtered = all.filter((r) => phases.has(r.phase) || r.kind === 'managed')
-    rulesets.value = filtered.length ? filtered : all
+    wafRules.value = await securityApi.listFirewallRules(props.zoneId)
   } catch (e) {
-    toast.error('加载 WAF 规则集失败', { description: e instanceof Error ? e.message : String(e) })
+    toast.error('加载 WAF 自定义规则失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
-    rulesetsLoading.value = false
+    wafRulesLoading.value = false
+  }
+}
+
+const WAF_ACTION_LABEL: Record<string, string> = {
+  block: '阻止',
+  challenge: '质询',
+  js_challenge: 'JS 质询',
+  managed_challenge: '托管质询',
+  log: '记录',
+  skip: '跳过',
+}
+
+function wafActionClass(a: string): string {
+  if (a === 'block') return 'bg-red-500/15 text-red-600'
+  if (a.includes('challenge')) return 'bg-amber-500/15 text-amber-600'
+  if (a === 'skip') return 'bg-emerald-500/15 text-emerald-600'
+  return 'bg-muted text-muted-foreground'
+}
+
+/* ----------------------------- 缓存规则（zone 维度） ----------------------------- */
+
+const cacheRules = ref<RulesetRule[]>([])
+const cacheRulesLoading = ref(false)
+
+async function loadCacheRules() {
+  if (!props.zoneId) return
+  cacheRulesLoading.value = true
+  try {
+    cacheRules.value = await securityApi.listCacheRules(props.zoneId)
+  } catch (e) {
+    toast.error('加载缓存规则失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    cacheRulesLoading.value = false
   }
 }
 
@@ -231,22 +255,60 @@ async function loadPageRules() {
   }
 }
 
-const ACTION_OPTIONS: { id: string; label: string; needsValue: boolean }[] = [
-  { id: 'ssl', label: 'SSL', needsValue: false },
-  { id: 'always_use_https', label: 'Always Use HTTPS', needsValue: false },
-  { id: 'cache_level', label: '缓存级别', needsValue: true },
-  { id: 'browser_cache_ttl', label: '浏览器缓存 TTL', needsValue: true },
-  { id: 'edge_cache_ttl', label: '边缘缓存 TTL', needsValue: true },
-  { id: 'forwarding_url', label: '转发 URL', needsValue: true },
-  { id: 'minify', label: '压缩', needsValue: true },
+/** Page Rule 动作定义：input 决定表单控件与 value 组装方式 */
+interface PageActionDef {
+  id: string
+  label: string
+  /** none: 无值；select: 枚举下拉；number: 整数秒；forwarding: URL + 状态码 */
+  input: 'none' | 'select' | 'number' | 'forwarding'
+  options?: { value: string; label: string }[]
+  defaultValue?: string
+}
+
+const ACTION_OPTIONS: PageActionDef[] = [
+  {
+    id: 'ssl',
+    label: 'SSL',
+    input: 'select',
+    options: [
+      { value: 'off', label: '关闭' },
+      { value: 'flexible', label: '灵活' },
+      { value: 'full', label: '完全' },
+      { value: 'strict', label: '完全（严格）' },
+    ],
+    defaultValue: 'full',
+  },
+  { id: 'always_use_https', label: 'Always Use HTTPS', input: 'none' },
+  {
+    id: 'cache_level',
+    label: '缓存级别',
+    input: 'select',
+    options: [
+      { value: 'bypass', label: '绕过' },
+      { value: 'basic', label: '基本' },
+      { value: 'simplified', label: '简化' },
+      { value: 'aggressive', label: '标准' },
+      { value: 'cache_everything', label: '缓存所有内容' },
+    ],
+    defaultValue: 'cache_everything',
+  },
+  { id: 'browser_cache_ttl', label: '浏览器缓存 TTL', input: 'number' },
+  { id: 'edge_cache_ttl', label: '边缘缓存 TTL', input: 'number' },
+  { id: 'forwarding_url', label: '转发 URL', input: 'forwarding' },
 ]
 
 function actionLabel(id: string): string {
   return ACTION_OPTIONS.find((a) => a.id === id)?.label ?? id
 }
 
+function fmtActionValue(v: PageRuleAction['value']): string {
+  if (v == null) return ''
+  if (typeof v === 'object') return `=${v.url} (${v.status_code})`
+  return `=${v}`
+}
+
 function summarizeActions(actions: PageRuleAction[]): string {
-  return actions.map((a) => `${actionLabel(a.id)}${a.value ? `=${a.value}` : ''}`).join(', ')
+  return actions.map((a) => `${actionLabel(a.id)}${fmtActionValue(a.value)}`).join(', ')
 }
 
 /* ----------------------------- 新建 Page Rule ----------------------------- */
@@ -256,19 +318,56 @@ const creatingPage = ref(false)
 const pageForm = ref({
   url: '',
   action: 'cache_level',
+  /** select / number 型动作的值（number 型为输入框字符串，提交时转整数） */
   value: 'cache_everything',
+  /** forwarding_url 专用：目标 URL 与重定向状态码 */
+  fwdUrl: '',
+  fwdStatus: '302' as '301' | '302',
   priority: 1,
   status: 'active' as 'active' | 'disabled',
 })
 
 function openAddPage() {
-  pageForm.value = { url: '', action: 'cache_level', value: 'cache_everything', priority: 1, status: 'active' }
+  pageForm.value = { url: '', action: 'cache_level', value: 'cache_everything', fwdUrl: '', fwdStatus: '302', priority: 1, status: 'active' }
   addPageOpen.value = true
 }
 
-const currentActionNeedsValue = computed(
-  () => ACTION_OPTIONS.find((a) => a.id === pageForm.value.action)?.needsValue ?? false,
+const currentActionDef = computed(
+  () => ACTION_OPTIONS.find((a) => a.id === pageForm.value.action) ?? ACTION_OPTIONS[0],
 )
+
+// 切换动作时把 value 重置为该动作的默认值，避免残留上一动作的取值
+watch(
+  () => pageForm.value.action,
+  () => {
+    pageForm.value.value = currentActionDef.value.defaultValue ?? ''
+  },
+)
+
+/** 按动作类型组装 action payload；输入非法时提示并返回 null */
+function buildPageAction(): PageRuleAction | null {
+  const def = currentActionDef.value
+  if (def.input === 'none') return { id: def.id }
+  if (def.input === 'forwarding') {
+    const target = pageForm.value.fwdUrl.trim()
+    if (!target) {
+      toast.error('请输入转发目标 URL')
+      return null
+    }
+    return { id: def.id, value: { url: target, status_code: Number(pageForm.value.fwdStatus) } }
+  }
+  if (def.input === 'number') {
+    const n = Number(pageForm.value.value)
+    // browser_cache_ttl 允许 0（CF 语义：尊重源站响应头）；edge_cache_ttl 必须为正
+    const min = def.id === 'browser_cache_ttl' ? 0 : 1
+    if (!Number.isInteger(n) || n < min) {
+      toast.error(min === 0 ? 'TTL 必须为非负整数（秒，0 = 尊重源站响应头）' : 'TTL 必须为正整数（秒）')
+      return null
+    }
+    return { id: def.id, value: n }
+  }
+  return { id: def.id, value: pageForm.value.value }
+}
 
 async function submitAddPage() {
   if (!props.zoneId) return
@@ -277,9 +376,8 @@ async function submitAddPage() {
     toast.error('请输入 URL 匹配模式')
     return
   }
-  const action: PageRuleAction = currentActionNeedsValue.value
-    ? { id: pageForm.value.action, value: pageForm.value.value }
-    : { id: pageForm.value.action }
+  const action = buildPageAction()
+  if (!action) return
   creatingPage.value = true
   try {
     await securityApi.createPageRule(props.zoneId, {
@@ -321,17 +419,24 @@ async function confirmDeletePage() {
 /* ----------------------------- 生命周期 ----------------------------- */
 
 const refreshing = computed(
-  () => certsLoading.value || rulesetsLoading.value || rulesLoading.value || pageRulesLoading.value,
+  () =>
+    certsLoading.value ||
+    wafRulesLoading.value ||
+    cacheRulesLoading.value ||
+    rulesLoading.value ||
+    pageRulesLoading.value,
 )
 
 async function reload() {
-  await Promise.all([loadCerts(), loadRulesets(), loadAccessRules(), loadPageRules()])
+  await Promise.all([loadCerts(), loadWafRules(), loadCacheRules(), loadAccessRules(), loadPageRules()])
 }
 
 watch(
   () => props.zoneId,
   () => {
     loadCerts()
+    loadWafRules()
+    loadCacheRules()
     loadAccessRules()
     loadPageRules()
   },
@@ -348,7 +453,7 @@ onMounted(() => {
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div>
         <h1 class="text-xl font-semibold tracking-tight">安全规则</h1>
-        <p class="text-sm text-muted-foreground">边缘证书、WAF 规则集、IP 访问规则与 Page Rules</p>
+        <p class="text-sm text-muted-foreground">边缘证书、WAF 自定义规则、缓存规则、IP 访问规则与 Page Rules</p>
       </div>
       <Button variant="ghost" size="sm" :disabled="refreshing" @click="reload">
         <RefreshCw class="size-4" :class="{ 'animate-spin': refreshing }" />
@@ -409,49 +514,102 @@ onMounted(() => {
       </CardContent>
     </Card>
 
-    <!-- WAF 规则集 -->
+    <!-- WAF 自定义规则 -->
     <Card>
       <CardHeader>
         <CardTitle class="flex items-center gap-2 text-base">
           <ShieldAlert class="size-4 text-primary" />
-          WAF 规则集
+          WAF 自定义规则
         </CardTitle>
-        <CardDescription>账号维度的托管规则集（只读）</CardDescription>
+        <CardDescription>该域名的 WAF 自定义规则（http_request_firewall_custom，只读）</CardDescription>
       </CardHeader>
       <CardContent class="p-0">
-        <div v-if="rulesetsLoading" class="divide-y">
+        <div v-if="wafRulesLoading" class="divide-y">
           <div v-for="i in 3" :key="i" class="flex items-center gap-3 px-4 py-3">
             <Skeleton class="h-5 flex-1" />
             <Skeleton class="h-5 w-24" />
             <Skeleton class="h-5 w-32" />
           </div>
         </div>
-        <div v-else-if="!rulesets.length" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
+        <div v-else-if="!wafRules.length" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
           <div class="flex size-12 items-center justify-center rounded-full bg-muted">
             <ShieldAlert class="size-6 text-muted-foreground" />
           </div>
-          <div class="text-sm text-muted-foreground">暂无规则集</div>
+          <div class="text-sm text-muted-foreground">暂无 WAF 自定义规则</div>
         </div>
         <template v-else>
-          <div class="grid grid-cols-[minmax(180px,2fr)_140px_140px_120px] gap-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
-            <span>名称</span>
-            <span>类型</span>
-            <span>Phase</span>
-            <span class="text-right">版本</span>
+          <div class="grid grid-cols-[minmax(160px,2fr)_minmax(200px,3fr)_110px_90px] gap-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
+            <span>描述</span>
+            <span>表达式</span>
+            <span>动作</span>
+            <span>状态</span>
           </div>
           <div class="divide-y">
             <div
-              v-for="r in rulesets"
+              v-for="r in wafRules"
               :key="r.id"
-              class="grid grid-cols-[minmax(180px,2fr)_140px_140px_120px] items-center gap-2 px-4 py-3 text-sm hover:bg-accent/40"
+              class="grid grid-cols-[minmax(160px,2fr)_minmax(200px,3fr)_110px_90px] items-center gap-2 px-4 py-3 text-sm hover:bg-accent/40"
             >
-              <div class="min-w-0">
-                <div class="truncate font-medium" :title="r.name">{{ r.name }}</div>
-                <div v-if="r.description" class="truncate text-xs text-muted-foreground" :title="r.description">{{ r.description }}</div>
-              </div>
-              <span class="truncate text-muted-foreground">{{ r.kind }}</span>
-              <code class="truncate text-xs text-muted-foreground" :title="r.phase">{{ r.phase }}</code>
-              <span class="text-right text-xs text-muted-foreground">{{ r.version ?? '—' }}</span>
+              <span class="truncate font-medium" :title="r.description">{{ r.description || '—' }}</span>
+              <code class="truncate font-mono text-xs text-muted-foreground" :title="r.expression">{{ r.expression }}</code>
+              <Badge variant="secondary" :class="wafActionClass(r.action)">{{ WAF_ACTION_LABEL[r.action] ?? r.action }}</Badge>
+              <Badge
+                variant="secondary"
+                :class="r.enabled ? 'bg-emerald-500/15 text-emerald-600' : 'bg-muted text-muted-foreground'"
+              >
+                {{ r.enabled ? '启用' : '禁用' }}
+              </Badge>
+            </div>
+          </div>
+        </template>
+      </CardContent>
+    </Card>
+
+    <!-- 缓存规则 -->
+    <Card>
+      <CardHeader>
+        <CardTitle class="flex items-center gap-2 text-base">
+          <Layers class="size-4 text-primary" />
+          缓存规则
+        </CardTitle>
+        <CardDescription>该域名的缓存规则（http_request_cache_settings，只读）</CardDescription>
+      </CardHeader>
+      <CardContent class="p-0">
+        <div v-if="cacheRulesLoading" class="divide-y">
+          <div v-for="i in 3" :key="i" class="flex items-center gap-3 px-4 py-3">
+            <Skeleton class="h-5 flex-1" />
+            <Skeleton class="h-5 w-24" />
+            <Skeleton class="h-5 w-32" />
+          </div>
+        </div>
+        <div v-else-if="!cacheRules.length" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
+          <div class="flex size-12 items-center justify-center rounded-full bg-muted">
+            <Layers class="size-6 text-muted-foreground" />
+          </div>
+          <div class="text-sm text-muted-foreground">暂无缓存规则</div>
+        </div>
+        <template v-else>
+          <div class="grid grid-cols-[minmax(160px,2fr)_minmax(200px,3fr)_140px_90px] gap-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
+            <span>描述</span>
+            <span>表达式</span>
+            <span>动作</span>
+            <span>状态</span>
+          </div>
+          <div class="divide-y">
+            <div
+              v-for="r in cacheRules"
+              :key="r.id"
+              class="grid grid-cols-[minmax(160px,2fr)_minmax(200px,3fr)_140px_90px] items-center gap-2 px-4 py-3 text-sm hover:bg-accent/40"
+            >
+              <span class="truncate font-medium" :title="r.description">{{ r.description || '—' }}</span>
+              <code class="truncate font-mono text-xs text-muted-foreground" :title="r.expression">{{ r.expression }}</code>
+              <code class="truncate text-xs text-muted-foreground" :title="r.action">{{ r.action }}</code>
+              <Badge
+                variant="secondary"
+                :class="r.enabled ? 'bg-emerald-500/15 text-emerald-600' : 'bg-muted text-muted-foreground'"
+              >
+                {{ r.enabled ? '启用' : '禁用' }}
+              </Badge>
             </div>
           </div>
         </template>
@@ -701,10 +859,42 @@ onMounted(() => {
                 </SelectContent>
               </Select>
             </div>
-            <div class="space-y-2">
+            <!-- 枚举型动作：下拉选值 -->
+            <div v-if="currentActionDef.input === 'select'" class="space-y-2">
               <Label>值</Label>
-              <Input v-model="pageForm.value" :disabled="!currentActionNeedsValue" :placeholder="currentActionNeedsValue ? '动作值' : '无需值'" />
+              <Select v-model="pageForm.value">
+                <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="o in currentActionDef.options ?? []" :key="o.value" :value="o.value">{{ o.label }}</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
+            <!-- TTL 型动作：整数秒 -->
+            <div v-else-if="currentActionDef.input === 'number'" class="space-y-2">
+              <Label>TTL（秒）</Label>
+              <Input v-model="pageForm.value" type="number" min="1" step="1" placeholder="如 14400" />
+            </div>
+            <!-- forwarding_url：值列放重定向状态码，URL 在下方整行输入 -->
+            <div v-else-if="currentActionDef.input === 'forwarding'" class="space-y-2">
+              <Label>重定向状态码</Label>
+              <Select v-model="pageForm.fwdStatus">
+                <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="301">301（永久）</SelectItem>
+                  <SelectItem value="302">302（临时）</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <!-- 无值动作 -->
+            <div v-else class="space-y-2">
+              <Label>值</Label>
+              <Input disabled placeholder="无需值" />
+            </div>
+          </div>
+          <div v-if="currentActionDef.input === 'forwarding'" class="space-y-2">
+            <Label>转发目标 URL</Label>
+            <Input v-model="pageForm.fwdUrl" placeholder="如 https://example.com/$1" />
+            <p class="text-xs text-muted-foreground">可用 $1、$2 引用匹配模式中的通配符</p>
           </div>
           <div class="grid grid-cols-2 gap-3">
             <div class="space-y-2">
