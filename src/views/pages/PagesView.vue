@@ -11,6 +11,7 @@ import {
   Trash2,
 } from '@lucide/vue'
 import { pagesApi } from '@/api/pages'
+import { useAuthStore } from '@/stores/auth'
 import type { PagesDeployment, PagesProject } from '@/types/cloudflare'
 import { Button } from '@/components/ui/button'
 import {
@@ -37,6 +38,9 @@ const NAME_RE = /^[a-z]([a-z0-9-]*[a-z0-9])?$/
 
 const projects = ref<PagesProject[]>([])
 const loading = ref(true)
+
+const auth = useAuthStore()
+const currentAccountId = computed(() => auth.currentAccount?.accountId ?? '—')
 
 // 当前进入的项目（null = 列表视图）
 const current = ref<PagesProject | null>(null)
@@ -210,6 +214,11 @@ function subdomainUrl(p: PagesProject): string {
           </div>
           <div class="font-medium">还没有 Pages 项目</div>
           <p class="text-sm text-muted-foreground">新建第一个项目，开始部署静态站点与全栈应用</p>
+          <p class="max-w-md text-xs text-muted-foreground">
+            当前账号 ID：<code class="rounded bg-muted px-1 font-mono">{{ currentAccountId }}</code>。
+            Pages / Workers / R2 等资源按 CF 账号隔离——若你的项目在同一凭据下的其他账号里，
+            请到「设置 → 添加账号」重新验证凭据并选择对应账号。
+          </p>
           <Button size="sm" @click="openCreate">
             <Plus class="size-4" />
             新建项目

@@ -2,9 +2,10 @@
 import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { toast } from 'vue-sonner'
-import { Cloud, Loader2, KeyRound, Mail, User } from '@lucide/vue'
+import { Cloud, Loader2, KeyRound, Mail, User, Building2 } from '@lucide/vue'
 import { useAuthStore, type Account } from '@/stores/auth'
 import { verifyCredentials } from '@/api'
+import type { CFAccount } from '@/types/cloudflare'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -20,6 +21,8 @@ const authType = ref<'global' | 'token'>('global')
 const email = ref('')
 const apiKey = ref('')
 const loading = ref(false)
+/** 凭据可见多个 CF 账号时的候选列表（非 null 时进入账号选择步骤） */
+const candidates = ref<CFAccount[] | null>(null)
 
 /** 账号凭据不可用（密文解密失败或密钥为空）：不允许直接进入 */
 function isBroken(acc: Account): boolean {
@@ -53,7 +56,41 @@ async function handleLogin() {
       toast.error('凭据验证失败', { description: res.error })
       return
     }
-    const acc = res.accounts[0]
+    // 凭据可见多个 CF 账号时让用户选择，避免默认取第一个导致资源"看不见"
+    if (res.accounts.length > 1) {
+      candidates.value = res.accounts
+      toast.info(`该凭据可管理 ${res.accounts.length} 个 Cloudflare 账号，请选择要进入的账号`)
+      return
+    }
+    finishLogin(res.accounts[0])
+  } catch (e) {
+    toast.error('登录异常', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    loading.value = false
+  }
+}
+
+/** 用选定的 CF 账号完成登录（addAccount 按 accountId+authType 去重，可重复进入不同账号） */
+function finishLogin(acc: CFAccount) {
+  auth.addAccount({
+    accountId: acc.id,
+    accountName: acc.name,
+    nickname: acc.name,
+    authType: authType.value,
+    email: authType.value === 'global' ? email.value : undefined,
+    apiKey: apiKey.value,
+  })
+  candidates.value = null
+  toast.success('登录成功，欢迎！')
+  router.push((route.query.redirect as string) || '/')
+}
+
+/** 一次性把凭据下全部 CF 账号加入本地列表，并进入第一个 */
+function addAllCandidates() {
+  const list = candidates.value
+  if (!list?.length) return
+  // 倒序添加：addAccount 会切换到新加账号，最终停在列表第一个
+  for (const acc of [...list].reverse()) {
     auth.addAccount({
       accountId: acc.id,
       accountName: acc.name,
@@ -62,13 +99,10 @@ async function handleLogin() {
       email: authType.value === 'global' ? email.value : undefined,
       apiKey: apiKey.value,
     })
-    toast.success('登录成功，欢迎！')
-    router.push((route.query.redirect as string) || '/')
-  } catch (e) {
-    toast.error('登录异常', { description: e instanceof Error ? e.message : String(e) })
-  } finally {
-    loading.value = false
   }
+  candidates.value = null
+  toast.success(`已添加 ${list.length} 个账号，可在侧边栏随时切换`)
+  router.push((route.query.redirect as string) || '/')
 }
 </script>
 
@@ -82,7 +116,32 @@ async function handleLogin() {
         <CardTitle class="text-2xl">CF Dashboard</CardTitle>
         <CardDescription>开源 · 自托管 · 凭据零上链的 Cloudflare 管理面板</CardDescription>
       </CardHeader>
-      <CardContent class="space-y-4">
+      <CardContent v-if="candidates" class="space-y-4">
+        <!-- 凭据可见多个 CF 账号：选择要进入的账号 -->
+        <div class="space-y-2">
+          <Label>选择要管理的 Cloudflare 账号</Label>
+          <Button
+            v-for="c in candidates"
+            :key="c.id"
+            variant="outline"
+            class="w-full justify-start gap-2"
+            @click="finishLogin(c)"
+          >
+            <Building2 class="size-4 text-muted-foreground" />
+            <span class="truncate">{{ c.name }}</span>
+            <span class="ml-auto shrink-0 font-mono text-xs text-muted-foreground">{{ c.id.slice(0, 8) }}…</span>
+          </Button>
+        </div>
+        <div class="flex gap-2">
+          <Button variant="secondary" class="flex-1" @click="addAllCandidates">全部添加</Button>
+          <Button variant="ghost" class="flex-1" @click="candidates = null">返回</Button>
+        </div>
+        <p class="text-center text-xs text-muted-foreground">
+          Workers / Pages / R2 等资源按账号隔离，选错账号会看不到已有项目
+        </p>
+      </CardContent>
+
+      <CardContent v-else class="space-y-4">
         <!-- 已有本地账号：直接选择登录，避免重复录入累积重复项 -->
         <template v-if="auth.accounts.length > 0">
           <div class="space-y-2">
