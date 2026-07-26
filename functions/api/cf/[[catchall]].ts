@@ -14,16 +14,27 @@ const UPSTREAM = 'https://api.cloudflare.com'
 /** 转发请求到 Cloudflare API */
 async function proxy(request: Request): Promise<Response> {
   const url = new URL(request.url)
+
+  // 跨站防护：浏览器发起的跨站请求会带 Sec-Fetch-Site（cross-site），直接拒绝；
+  // 同源前端（same-origin/same-site/none）与非浏览器工具（curl 等无此头）不受影响
+  const secFetchSite = request.headers.get('sec-fetch-site')
+  if (secFetchSite && !['same-origin', 'same-site', 'none'].includes(secFetchSite)) {
+    return new Response(
+      JSON.stringify({ success: false, errors: [{ code: 0, message: '跨站请求被拒绝' }] }),
+      { status: 403, headers: { 'content-type': 'application/json' } },
+    )
+  }
+
   // 去掉 /api/cf 前缀，保留后续 path + query
   const cfPath = url.pathname.replace(/^\/api\/cf/, '') + url.search
   const target = UPSTREAM + cfPath
 
-  // 透传请求头，剥离可能干扰上游或暴露内部信息的头
+  // 透传请求头，剥离可能干扰上游或暴露内部信息的头（cookie 与上游无关，一并剥离）
   const headers = new Headers(request.headers)
   for (const h of [
     'host', 'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor',
     'x-forwarded-for', 'x-forwarded-proto', 'x-real-ip',
-    'cdn-loop', 'true-client-ip',
+    'cdn-loop', 'true-client-ip', 'cookie',
   ]) {
     headers.delete(h)
   }
@@ -53,6 +64,8 @@ async function proxy(request: Request): Promise<Response> {
   respHeaders.set('access-control-allow-credentials', 'true')
   // 移除可能阻止浏览器读取的头
   respHeaders.delete('x-frame-options')
+  // 剥离上游 set-cookie（如 __cfruid）：透传会把它种到面板域名下，纯脏数据
+  respHeaders.delete('set-cookie')
 
   return new Response(upstream.body, {
     status: upstream.status,
