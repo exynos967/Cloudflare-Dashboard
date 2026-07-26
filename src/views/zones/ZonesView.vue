@@ -31,13 +31,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { zonesApi } from '@/api'
 import { useAuthStore } from '@/stores/auth'
 import type { Zone } from '@/types/cloudflare'
@@ -48,29 +41,24 @@ const auth = useAuthStore()
 const zones = ref<Zone[]>([])
 const loading = ref(true)
 const keyword = ref('')
-let searchTimer: ReturnType<typeof setTimeout> | null = null
-/** 请求序号：搜索连发时丢弃后发先至的旧响应，避免覆盖新结果 */
-let loadSeq = 0
 
+/** CF 的 ?name= 是精确匹配，子串搜不到；改为拉全量后本地过滤 */
 async function load() {
-  const seq = ++loadSeq
   loading.value = true
   try {
-    const list = await zonesApi.listAll({ name: keyword.value.trim() || undefined })
-    if (seq !== loadSeq) return
-    zones.value = list
+    zones.value = await zonesApi.listAll()
   } catch (e) {
-    if (seq !== loadSeq) return
     toast.error('加载域名列表失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
-    if (seq === loadSeq) loading.value = false
+    loading.value = false
   }
 }
 
-function onSearchInput() {
-  if (searchTimer) clearTimeout(searchTimer)
-  searchTimer = setTimeout(load, 350)
-}
+const filteredZones = computed(() => {
+  const kw = keyword.value.trim().toLowerCase()
+  if (!kw) return zones.value
+  return zones.value.filter((z) => z.name.includes(kw))
+})
 
 onMounted(load)
 
@@ -78,17 +66,18 @@ onMounted(load)
 
 const addOpen = ref(false)
 const newName = ref('')
-const selectedAccountId = ref<string>('')
 const creating = ref(false)
 const createdZone = ref<Zone | null>(null)
 
-const accountOptions = computed(() =>
-  auth.accounts.map((a) => ({ id: a.accountId, name: a.accountName || a.nickname || a.accountId })),
-)
+/** 添加域名固定使用当前账号（请求凭据即当前账号，选其他账号必 403） */
+const currentAccountLabel = computed(() => {
+  const a = auth.currentAccount
+  if (!a) return '—'
+  return a.accountName || a.nickname || a.accountId
+})
 
 function openAdd() {
   newName.value = ''
-  selectedAccountId.value = auth.currentAccount?.accountId ?? accountOptions.value[0]?.id ?? ''
   createdZone.value = null
   addOpen.value = true
 }
@@ -96,18 +85,30 @@ function openAdd() {
 async function submitAdd() {
   // Enter 键可绕过按钮 disabled，函数级并发守卫
   if (creating.value) return
-  const name = newName.value.trim()
+  let name = newName.value.trim().toLowerCase()
   if (!name) {
     toast.error('请输入域名')
     return
   }
-  if (!selectedAccountId.value) {
-    toast.error('请选择所属账户')
+  // 剥离 scheme/路径并转 punycode：URL 解析一步完成
+  try {
+    name = new URL(`http://${name.replace(/^[a-z][a-z0-9+.-]*:\/\//, '')}`).hostname.replace(/\.$/, '')
+  } catch {
+    toast.error('域名格式不合法')
+    return
+  }
+  if (!name.includes('.')) {
+    toast.error('域名格式不合法', { description: '请输入完整域名，如 example.com' })
+    return
+  }
+  const accountId = auth.currentAccount?.accountId
+  if (!accountId) {
+    toast.error('未找到当前账号，请先添加或切换账号')
     return
   }
   creating.value = true
   try {
-    const z = await zonesApi.create(name, { id: selectedAccountId.value })
+    const z = await zonesApi.create(name, { id: accountId })
     createdZone.value = z
     toast.success('域名已创建')
     await load()
@@ -131,9 +132,19 @@ async function copy(text: string, label = '内容') {
 
 const deleteTarget = ref<Zone | null>(null)
 const deleting = ref(false)
+/** 强确认：需输入完整域名才允许删除 */
+const deleteConfirmText = ref('')
+const deleteConfirmed = computed(
+  () => !!deleteTarget.value && deleteConfirmText.value.trim().toLowerCase() === deleteTarget.value.name.toLowerCase(),
+)
+
+function openDelete(z: Zone) {
+  deleteConfirmText.value = ''
+  deleteTarget.value = z
+}
 
 async function confirmDelete() {
-  if (!deleteTarget.value) return
+  if (!deleteTarget.value || !deleteConfirmed.value) return
   deleting.value = true
   try {
     await zonesApi.delete(deleteTarget.value.id)
@@ -148,11 +159,8 @@ async function confirmDelete() {
 }
 
 function fmtDate(s: string): string {
-  try {
-    return new Date(s).toLocaleString('zh-CN', { hour12: false })
-  } catch {
-    return s
-  }
+  const d = new Date(s)
+  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString('zh-CN', { hour12: false })
 }
 </script>
 
@@ -183,14 +191,13 @@ function fmtDate(s: string): string {
         v-model="keyword"
         placeholder="按域名名称搜索"
         class="pl-8"
-        @input="onSearchInput"
       />
     </div>
 
     <!-- 列表 -->
     <Card>
-      <CardHeader v-if="!loading && zones.length">
-        <CardTitle class="text-base">共 {{ zones.length }} 个域名</CardTitle>
+      <CardHeader v-if="!loading && filteredZones.length">
+        <CardTitle class="text-base">共 {{ filteredZones.length }} 个域名</CardTitle>
       </CardHeader>
       <CardContent class="p-0">
         <!-- 表头 -->
@@ -217,17 +224,19 @@ function fmtDate(s: string): string {
 
         <!-- 空状态 -->
         <div
-          v-else-if="!zones.length"
+          v-else-if="!filteredZones.length"
           class="flex flex-col items-center gap-3 px-4 py-16 text-center"
         >
           <div class="flex size-12 items-center justify-center rounded-full bg-muted">
             <Globe class="size-6 text-muted-foreground" />
           </div>
           <div>
-            <div class="font-medium">还没有域名</div>
-            <p class="text-sm text-muted-foreground">添加你的第一个 Cloudflare 域名</p>
+            <div class="font-medium">{{ zones.length ? '没有匹配的域名' : '还没有域名' }}</div>
+            <p class="text-sm text-muted-foreground">
+              {{ zones.length ? '换个关键词试试' : '添加你的第一个 Cloudflare 域名' }}
+            </p>
           </div>
-          <Button size="sm" @click="openAdd">
+          <Button v-if="!zones.length" size="sm" @click="openAdd">
             <Plus class="size-4" />
             添加域名
           </Button>
@@ -236,7 +245,7 @@ function fmtDate(s: string): string {
         <!-- 数据行 -->
         <div v-else class="divide-y">
           <div
-            v-for="z in zones"
+            v-for="z in filteredZones"
             :key="z.id"
             class="group grid grid-cols-[minmax(160px,2fr)_100px_minmax(120px,1fr)_minmax(120px,1fr)_140px_60px] items-center gap-2 px-4 py-3 text-sm hover:bg-accent/40"
           >
@@ -268,7 +277,7 @@ function fmtDate(s: string): string {
                 size="icon-sm"
                 class="text-destructive hover:text-destructive opacity-60 group-hover:opacity-100"
                 title="删除"
-                @click.stop="deleteTarget = z"
+                @click.stop="openDelete(z)"
               >
                 <Trash2 class="size-3.5" />
               </Button>
@@ -294,16 +303,8 @@ function fmtDate(s: string): string {
           </div>
           <div class="space-y-2">
             <Label>所属账户</Label>
-            <Select v-model="selectedAccountId">
-              <SelectTrigger class="w-full">
-                <SelectValue placeholder="选择账户" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem v-for="a in accountOptions" :key="a.id" :value="a.id">
-                  {{ a.name }}（{{ a.id }}）
-                </SelectItem>
-              </SelectContent>
-            </Select>
+            <div class="rounded-md border bg-muted/30 px-3 py-2 text-sm">{{ currentAccountLabel }}</div>
+            <p class="text-xs text-muted-foreground">域名将添加到当前账号，要在其他账号下添加请先切换账号</p>
           </div>
         </div>
 
@@ -344,8 +345,8 @@ function fmtDate(s: string): string {
       </DialogContent>
     </Dialog>
 
-    <!-- 删除确认 -->
-    <Dialog :open="!!deleteTarget" @update:open="(v) => { if (!v) deleteTarget = null }">
+    <!-- 删除确认（删除中禁止关闭 Dialog，防止误触后状态悬空） -->
+    <Dialog :open="!!deleteTarget" @update:open="(v) => { if (!v && !deleting) deleteTarget = null }">
       <DialogContent class="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>删除域名</DialogTitle>
@@ -354,9 +355,13 @@ function fmtDate(s: string): string {
             删除后该域名的 DNS 记录与相关配置将丢失，此操作不可撤销。
           </DialogDescription>
         </DialogHeader>
+        <div class="space-y-2">
+          <Label>输入完整域名以确认</Label>
+          <Input v-model="deleteConfirmText" :placeholder="deleteTarget?.name" :disabled="deleting" />
+        </div>
         <DialogFooter>
-          <Button variant="outline" @click="deleteTarget = null">取消</Button>
-          <Button variant="destructive" :disabled="deleting" @click="confirmDelete">
+          <Button variant="outline" :disabled="deleting" @click="deleteTarget = null">取消</Button>
+          <Button variant="destructive" :disabled="deleting || !deleteConfirmed" @click="confirmDelete">
             <Loader2 v-if="deleting" class="size-4 animate-spin" />
             确认删除
           </Button>
