@@ -74,7 +74,6 @@ import {
   type ZoneSettingItem,
   type SettingDef,
   type SettingValue,
-  type MinifyValue,
 } from '@/api'
 import { usePresetsStore } from '@/stores/presets'
 import DNSRecordManager from '@/components/dns/DNSRecordManager.vue'
@@ -101,6 +100,14 @@ async function load() {
 }
 
 onMounted(load)
+
+// 路由参数 zoneId 变化时组件被复用：重置本地状态并重新加载，避免显示 A 的数据、写入 B 的 zone
+watch(zoneId, () => {
+  zone.value = null
+  zoneSettings.value = {}
+  load()
+  if (activeTab.value === 'preset') loadZoneSettings()
+})
 
 // 切到「配置预设」tab 时懒加载当前 zone settings（单项调节读当前值用）
 watch(activeTab, (t) => {
@@ -147,7 +154,8 @@ const applyingPresetId = ref<string | null>(null)
 /** 单项调节：当前 zone 各 setting 实际值 */
 const zoneSettings = ref<Record<string, ZoneSettingItem>>({})
 const settingsLoading = ref(false)
-const singleApplying = ref<string | null>(null)
+/** 正在写入中的 setting id 集合：并发调节多个设置时各自独立 disabled，互不干扰 */
+const singleApplying = ref<Set<string>>(new Set())
 
 async function loadZoneSettings() {
   if (!zoneId.value) return
@@ -223,7 +231,7 @@ async function applyPreset(preset: OptimizationPreset) {
 
 /** 单项调节：实时写一项 */
 async function applySingle(defId: string, value: SettingValue) {
-  singleApplying.value = defId
+  singleApplying.value.add(defId)
   try {
     await applySingleSetting(zoneId.value, defId, value)
     // 本地乐观更新
@@ -235,7 +243,7 @@ async function applySingle(defId: string, value: SettingValue) {
   } catch (e) {
     toast.error('更新失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
-    singleApplying.value = null
+    singleApplying.value.delete(defId)
   }
 }
 
@@ -247,14 +255,10 @@ const editingPreset = ref<OptimizationPreset | null>(null)
 const editorDraft = ref<OptimizationPreset | null>(null)
 
 function openEditor(preset: OptimizationPreset) {
-  // 内置预设只读：编辑时自动另存为用户预设副本，再编辑该副本（保存即更新副本）
-  if (preset.builtin) {
-    const copy = presetsStore.duplicatePreset(preset)
-    selectedPresetId.value = copy.id
-    preset = copy
-  }
+  // 内置预设只读：仅编辑深拷贝草稿，保存时才另存为用户预设副本（取消编辑不残留副本）
   editingPreset.value = preset
-  editorDraft.value = structuredClone(preset)
+  // JSON 深拷贝断开引用：preset 可能是响应式 Proxy（structuredClone 克隆 Proxy 必抛 DataCloneError）
+  editorDraft.value = JSON.parse(JSON.stringify(preset)) as OptimizationPreset
   editorOpen.value = true
 }
 
@@ -298,7 +302,12 @@ function saveDraft() {
     toast.error('请填写预设名称')
     return
   }
-  if (editingPreset.value) {
+  if (editingPreset.value?.builtin) {
+    // 内置预设只读：保存时另存为用户预设副本
+    const created = presetsStore.createPreset(name, editorDraft.value.settings, editorDraft.value.description)
+    selectedPresetId.value = created.id
+    toast.success('内置预设不可修改，已另存为用户预设')
+  } else if (editingPreset.value) {
     // 编辑已有用户预设
     presetsStore.updatePreset(editingPreset.value.id, {
       name,
@@ -347,6 +356,12 @@ function deletePreset(preset: OptimizationPreset) {
 
 async function confirmDeletePreset() {
   if (!presetDeleteTarget.value) return
+  // 防御性守卫：内置预设（含「当前」虚拟预设）不可删除
+  if (presetDeleteTarget.value.builtin || presetDeleteTarget.value.id === CURRENT_PRESET_ID) {
+    toast.error('内置预设不可删除')
+    presetDeleteTarget.value = null
+    return
+  }
   presetDeleting.value = true
   try {
     const id = presetDeleteTarget.value.id
@@ -368,14 +383,6 @@ async function confirmDeletePreset() {
 function displayValue(def: SettingDef, value: SettingValue | undefined): string {
   if (value === undefined) return '—'
   if (def.type === 'onoff') return onoffLabel(value)
-  if (def.type === 'minify' && typeof value === 'object' && value) {
-    const m = value as MinifyValue
-    const on: string[] = []
-    if (m.html === 'on') on.push('HTML')
-    if (m.css === 'on') on.push('CSS')
-    if (m.js === 'on') on.push('JS')
-    return on.length ? on.join('+') : '关闭'
-  }
   if (def.type === 'number') return fmtSeconds(Number(value))
   if (def.type === 'select' || def.type === 'security_level') {
     return optionLabel(def.id, String(value))
@@ -387,13 +394,13 @@ function defaultForSetting(defId: string): SettingValue {
   const def = getSettingDef(defId)
   if (!def) return 'off'
   if (def.type === 'onoff') return 'off'
-  if (def.type === 'minify') return { html: 'off', css: 'off', js: 'off' } as MinifyValue
   if (def.type === 'number') return def.numberOptions?.[0] ?? 0
   return def.options?.[0] ?? ''
 }
 
 function fmtSeconds(sec: number): string {
-  if (sec <= 0) return '不缓存'
+  // CF 语义：browser_cache_ttl=0 表示遵循源站响应头（Respect Existing Headers），并非不缓存
+  if (sec <= 0) return '遵循源站响应头'
   if (sec < 60) return `${sec} 秒`
   if (sec < 3600) return `${Math.round(sec / 60)} 分钟`
   if (sec < 86400) return `${Math.round(sec / 3600)} 小时`
@@ -408,33 +415,6 @@ const SETTING_GROUPS: { key: SettingDef['group']; label: string }[] = [
   { key: 'cache', label: '缓存' },
   { key: 'speed', label: '速度优化' },
 ]
-
-/** 单项调节：minify 子项切换（html/css/js 各自 on/off） */
-function toggleMinify(defId: string, key: 'html' | 'css' | 'js') {
-  const cur = currentValue(defId) as MinifyValue | undefined
-  const next: MinifyValue = {
-    html: cur?.html ?? 'off',
-    css: cur?.css ?? 'off',
-    js: cur?.js ?? 'off',
-  }
-  next[key] = next[key] === 'on' ? 'off' : 'on'
-  applySingle(defId, next)
-}
-
-/** 编辑器草稿：minify 子项切换 */
-function toggleDraftMinify(defId: string, key: 'html' | 'css' | 'js') {
-  if (!editorDraft.value) return
-  const cur = editorDraft.value.settings[defId] as MinifyValue | undefined
-  const next: MinifyValue = {
-    html: cur?.html ?? 'off',
-    css: cur?.css ?? 'off',
-    js: cur?.js ?? 'off',
-  }
-  next[key] = next[key] === 'on' ? 'off' : 'on'
-  setDraftValue(defId, next)
-}
-
-
 
 async function copy(text: string, label = '内容') {
   try {
@@ -709,14 +689,14 @@ function fmtDate(s: string | null): string {
                     <Switch
                       v-if="def.type === 'onoff'"
                       :model-value="currentValue(def.id) === 'on'"
-                      :disabled="singleApplying === def.id"
+                      :disabled="singleApplying.has(def.id)"
                       @update:model-value="(v) => applySingle(def.id, v ? 'on' : 'off')"
                     />
                     <!-- select / security_level -->
                     <Select
                       v-else-if="def.type === 'select' || def.type === 'security_level'"
                       :model-value="String(currentValue(def.id) ?? '')"
-                      :disabled="singleApplying === def.id"
+                      :disabled="singleApplying.has(def.id)"
                       @update:model-value="(v) => applySingle(def.id, String(v))"
                     >
                       <SelectTrigger class="w-36">
@@ -730,7 +710,7 @@ function fmtDate(s: string | null): string {
                     <Select
                       v-else-if="def.type === 'number'"
                       :model-value="String(currentValue(def.id) ?? '')"
-                      :disabled="singleApplying === def.id"
+                      :disabled="singleApplying.has(def.id)"
                       @update:model-value="(v) => applySingle(def.id, Number(v))"
                     >
                       <SelectTrigger class="w-36">
@@ -742,20 +722,6 @@ function fmtDate(s: string | null): string {
                         </SelectItem>
                       </SelectContent>
                     </Select>
-                    <!-- minify -->
-                    <div v-else-if="def.type === 'minify'" class="flex gap-1">
-                      <Button
-                        v-for="k in (['html', 'css', 'js'] as const)"
-                        :key="k"
-                        :variant="(currentValue(def.id) as MinifyValue | undefined)?.[k] === 'on' ? 'default' : 'outline'"
-                        size="sm"
-                        class="h-7 px-2 text-xs"
-                        :disabled="singleApplying === def.id"
-                        @click="toggleMinify(def.id, k)"
-                      >
-                        {{ k.toUpperCase() }}
-                      </Button>
-                    </div>
                   </div>
                 </div>
               </div>
@@ -832,18 +798,6 @@ function fmtDate(s: string | null): string {
                           </SelectItem>
                         </SelectContent>
                       </Select>
-                      <div v-else-if="def.type === 'minify'" class="flex gap-1">
-                        <Button
-                          v-for="k in (['html', 'css', 'js'] as const)"
-                          :key="k"
-                          :variant="(editorDraft.settings[def.id] as MinifyValue)?.[k] === 'on' ? 'default' : 'outline'"
-                          size="sm"
-                          class="h-7 px-2 text-xs"
-                          @click="toggleDraftMinify(def.id, k)"
-                        >
-                          {{ k.toUpperCase() }}
-                        </Button>
-                      </div>
                     </div>
                   </div>
                 </div>

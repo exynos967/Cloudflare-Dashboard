@@ -58,7 +58,9 @@ export const usePresetsStore = defineStore('presets', () => {
       name,
       builtin: false,
       description,
-      settings: settings as OptimizationPreset['settings'],
+      // 深拷贝断开引用：调用方可能传入响应式 Proxy（structuredClone 克隆 Proxy 会抛
+      // DataCloneError），settings 本就要求可 JSON 序列化（进 localStorage），故用 JSON 拷贝
+      settings: JSON.parse(JSON.stringify(settings)) as OptimizationPreset['settings'],
     }
     userPresets.value = [...userPresets.value, preset]
     return preset
@@ -68,7 +70,8 @@ export const usePresetsStore = defineStore('presets', () => {
   function duplicatePreset(src: OptimizationPreset, newName?: string): OptimizationPreset {
     return createPreset(
       newName ?? `${src.name} 副本`,
-      { ...structuredClone(src.settings) },
+      // 同 createPreset：src 可能来自响应式 Proxy，structuredClone 会抛 DataCloneError，改用 JSON 深拷贝
+      JSON.parse(JSON.stringify(src.settings)) as OptimizationPreset['settings'],
       src.description,
     )
   }

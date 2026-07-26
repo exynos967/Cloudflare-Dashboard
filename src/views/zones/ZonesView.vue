@@ -49,15 +49,21 @@ const zones = ref<Zone[]>([])
 const loading = ref(true)
 const keyword = ref('')
 let searchTimer: ReturnType<typeof setTimeout> | null = null
+/** 请求序号：搜索连发时丢弃后发先至的旧响应，避免覆盖新结果 */
+let loadSeq = 0
 
 async function load() {
+  const seq = ++loadSeq
   loading.value = true
   try {
-    zones.value = await zonesApi.list({ name: keyword.value.trim() || undefined })
+    const list = await zonesApi.listAll({ name: keyword.value.trim() || undefined })
+    if (seq !== loadSeq) return
+    zones.value = list
   } catch (e) {
+    if (seq !== loadSeq) return
     toast.error('加载域名列表失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
@@ -88,6 +94,8 @@ function openAdd() {
 }
 
 async function submitAdd() {
+  // Enter 键可绕过按钮 disabled，函数级并发守卫
+  if (creating.value) return
   const name = newName.value.trim()
   if (!name) {
     toast.error('请输入域名')
