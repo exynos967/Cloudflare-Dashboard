@@ -6,7 +6,7 @@
 /** Cloudflare API 统一响应壳 */
 export interface CFResponse<T> {
   result: T | null
-  result_info?: unknown
+  result_info?: ResultInfo
   success: boolean
   errors: CFError[]
   messages: CFMessage[]
@@ -22,13 +22,14 @@ export interface CFMessage {
   message: string
 }
 
-/** 分页信息 */
+/** 分页信息（部分端点为 cursor 分页，字段均可能缺失） */
 export interface ResultInfo {
-  page: number
-  per_page: number
-  total_pages: number
-  count: number
-  total_count: number
+  page?: number
+  per_page?: number
+  total_pages?: number
+  count?: number
+  total_count?: number
+  cursor?: string
 }
 
 export interface Paginated<T> {
@@ -56,7 +57,7 @@ export interface Zone {
   original_dnshost: string | null
   account: CFAccount
   permissions: string[]
-  plan?: { id: string; name: string; legacy_id: number; is_subscribed: boolean; expiry: string | null }
+  plan?: { id: string; name: string; legacy_id: string; is_subscribed: boolean; expiry: string | null }
   activated_on: string | null
   modified_on: string
 }
@@ -152,12 +153,13 @@ export interface KVKey {
 export interface R2Bucket {
   name: string
   creation_date: string
-  location: 'apac' | 'eeur' | 'enam' | 'weur' | 'wnam' | 'auto'
+  location: 'apac' | 'eeur' | 'enam' | 'weur' | 'wnam' | 'oc' | 'auto'
   usage?: { payloadSize: number; uploadedBytes: string; uploadedPercent: number }
 }
 
+/** R2 对象。注意：CF REST API 返回的对象名字段是 key（不是 name） */
 export interface R2Object {
-  name: string
+  key: string
   size: number
   etag: string
   last_modified: string

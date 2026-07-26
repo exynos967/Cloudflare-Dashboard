@@ -1,5 +1,5 @@
 import { useAuthStore } from '@/stores/auth'
-import type { CFResponse } from '@/types/cloudflare'
+import type { CFResponse, ResultInfo } from '@/types/cloudflare'
 
 /**
  * Cloudflare API 客户端。
@@ -28,7 +28,8 @@ export function authHeaders(): Record<string, string> {
   const acc = useAuthStore().currentAccount
   if (!acc) throw new CFError('未登录 Cloudflare 账号', 401)
   if (acc.authType === 'token') return { Authorization: `Bearer ${acc.apiKey}` }
-  return { 'X-Auth-Email': acc.email ?? '', 'X-Auth-Key': acc.apiKey }
+  if (!acc.email) throw new CFError('Global API Key 模式缺少邮箱，请到设置中补全该账号的邮箱', 401)
+  return { 'X-Auth-Email': acc.email, 'X-Auth-Key': acc.apiKey }
 }
 
 export interface RequestOptions {
@@ -38,11 +39,11 @@ export interface RequestOptions {
   noAuth?: boolean
 }
 
-async function request<T>(
+async function requestWithInfo<T>(
   method: string,
   path: string,
   opts: RequestOptions = {},
-): Promise<T> {
+): Promise<{ result: T; resultInfo?: ResultInfo }> {
   const url = new URL(BASE + path, globalThis.location.origin)
   for (const [k, v] of Object.entries(opts.params ?? {})) {
     if (v !== undefined && v !== null) url.searchParams.set(k, String(v))
@@ -76,7 +77,47 @@ async function request<T>(
     const msg = data.errors?.[0]?.message ?? `HTTP ${res.status}`
     throw new CFError(msg, data.errors?.[0]?.code, res.status)
   }
-  return data.result as T
+  return { result: data.result as T, resultInfo: data.result_info }
+}
+
+async function request<T>(
+  method: string,
+  path: string,
+  opts: RequestOptions = {},
+): Promise<T> {
+  const { result } = await requestWithInfo<T>(method, path, opts)
+  return result
+}
+
+/**
+ * GET 列表端点并自动翻完所有页，返回聚合后的全量数组。
+ *
+ * - 优先按 result_info.total_pages 判断是否还有下一页；
+ * - 端点不返回 result_info 时，以「本页条数 == per_page」作为可能有下一页的启发式；
+ * - maxPages 为安全上限，防止异常端点导致无限翻页。
+ */
+export async function listAll<T>(
+  path: string,
+  params: Record<string, string | number | boolean | undefined | null> = {},
+  opts: { perPage?: number; maxPages?: number } = {},
+): Promise<T[]> {
+  const perPage = opts.perPage ?? 50
+  const maxPages = opts.maxPages ?? 50
+  const all: T[] = []
+  for (let page = 1; page <= maxPages; page++) {
+    const { result, resultInfo } = await requestWithInfo<T[] | null>('GET', path, {
+      params: { ...params, page, per_page: perPage },
+    })
+    const items = result ?? []
+    all.push(...items)
+    const totalPages = resultInfo?.total_pages
+    if (totalPages != null) {
+      if (page >= totalPages) break
+    } else if (items.length < perPage) {
+      break
+    }
+  }
+  return all
 }
 
 export const http = {
@@ -103,12 +144,24 @@ export async function graphql<T>(query: string): Promise<T> {
     'Content-Type': 'application/json',
     ...authHeaders(),
   }
-  const res = await fetch(new URL('/api/cf/client/v4/graphql', globalThis.location.origin), {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ query }),
-  })
-  const data = (await res.json()) as GraphQLResponse<T>
+  let res: Response
+  try {
+    res = await fetch(new URL('/api/cf/client/v4/graphql', globalThis.location.origin), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ query }),
+    })
+  } catch (e) {
+    throw new CFError(
+      `网络请求失败：${e instanceof Error ? e.message : String(e)}（请确认同源代理 /api/cf 可达）`,
+    )
+  }
+  let data: GraphQLResponse<T>
+  try {
+    data = (await res.json()) as GraphQLResponse<T>
+  } catch {
+    throw new CFError(`GraphQL 响应解析失败（HTTP ${res.status}）`, undefined, res.status)
+  }
   if (!res.ok || (data.errors && data.errors.length)) {
     const msg = data.errors?.[0]?.message ?? `HTTP ${res.status}`
     throw new CFError(msg, data.errors?.[0]?.code, res.status)
