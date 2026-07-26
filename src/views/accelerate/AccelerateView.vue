@@ -63,7 +63,7 @@ const zonesLoading = ref(false)
 async function loadZones() {
   zonesLoading.value = true
   try {
-    zones.value = await zonesApi.list({ per_page: 50 })
+    zones.value = await zonesApi.listAll()
   } catch (e) {
     toast.error('加载域名列表失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
@@ -105,7 +105,13 @@ watch(accessDomain, (d) => {
 })
 
 function onWorkerNameInput() {
-  workerNameTouched = true
+  // 清空时复位 touched，恢复按访问域名自动生成
+  if (!form.workerName.trim()) {
+    workerNameTouched = false
+    if (accessDomain.value) form.workerName = generateWorkerName(accessDomain.value)
+  } else {
+    workerNameTouched = true
+  }
 }
 
 const originDomainValue = computed(() =>
@@ -142,9 +148,14 @@ function applyProgress(p: DeployProgress) {
     steps.value[idx].status = 'error'
   }
   progress.value = Math.min(100, Math.round(((idx + (p.step === 'done' ? 1 : 0.5)) / 3) * 100))
-  if (p.step === 'upload') toast.info('正在上传 Worker 脚本…')
-  else if (p.step === 'dns') toast.info('正在配置 DNS 与路由…')
-  else if (p.step === 'done') toast.success('加速部署完成')
+  // 展示编排层带出的步骤消息；步骤失败用 warning 暴露原因，避免「步骤打叉但 toast 报成功」
+  if (!p.ok) {
+    toast.warning(p.message || '部署步骤出现问题')
+    return
+  }
+  if (p.step === 'upload') toast.info(p.message || '正在上传 Worker 脚本…')
+  else if (p.step === 'dns') toast.info(p.message || '正在配置 DNS 与路由…')
+  else if (p.step === 'done') toast.success(p.message || '加速部署完成')
 }
 
 async function onDeploy() {
@@ -156,16 +167,31 @@ async function onDeploy() {
     toast.error('访问域名不完整')
     return
   }
-  if (!/^https?:\/\//i.test(form.originUrl)) {
-    toast.error('源站域名需以 http:// 或 https:// 开头')
+  // 主机名仅允许单级前缀（字母/数字/连字符），防止误填完整域名拼出 www.example.com.example.com
+  const host = form.host.trim()
+  if (host && host !== '@' && !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i.test(host)) {
+    toast.error('主机名格式不正确', { description: '仅支持单级前缀（字母/数字/连字符），不要填完整域名' })
+    return
+  }
+  // 源站 URL 用 URL 解析校验，仅接受 http/https
+  try {
+    const u = new URL(form.originUrl.trim())
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('protocol')
+  } catch {
+    toast.error('源站域名格式不正确', { description: '需为完整 URL，如 https://origin.example.com' })
     return
   }
   if (customOriginMode.value && !form.customOrigin.trim()) {
     toast.error('请填写自定义优选回源域名')
     return
   }
-  if (!form.workerName.trim()) {
+  const workerName = form.workerName.trim()
+  if (!workerName) {
     toast.error('请填写 Worker 名称')
+    return
+  }
+  if (!/^[a-z0-9_-]{1,63}$/.test(workerName)) {
+    toast.error('Worker 名称格式不正确', { description: '仅支持小写字母、数字、连字符与下划线，且不超过 63 字符' })
     return
   }
 
@@ -174,7 +200,9 @@ async function onDeploy() {
     originUrl: form.originUrl.trim(),
     cacheTtl: Number(form.cacheTtl) || 0,
     originDomain: originDomainValue.value || DEFAULT_ORIGIN_DOMAIN,
-    workerName: form.workerName.trim(),
+    workerName,
+    // 用户已在表单选定 zone，直传避免按域名反查选错（父子 zone 并存场景）
+    zoneId: form.zoneId,
   }
 
   deploying.value = true
@@ -186,6 +214,8 @@ async function onDeploy() {
     toast.success('一键加速部署完成', {
       description: `Worker ${res.workerName} · CNAME → ${config.originDomain}`,
     })
+    // 刷新已加速列表，让新部署立即可见
+    void detect()
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     // 标记当前进行中的步骤为错误

@@ -10,11 +10,12 @@
  *   3. 「已加速域名」通过对账号下所有 zone 扫描 CNAME 匹配优选回源域名 +
  *      校验对应 Worker 脚本存在来识别
  */
+import { CFError, http, listAll } from './client'
 import { dnsApi } from './dns'
 import { zonesApi } from './zones'
 import { workersApi } from './workers'
 import { listCustomHostnames } from './saas'
-import type { DNSRecord, Zone } from '@/types/cloudflare'
+import type { DNSRecord, DNSRecordPayload, WorkerRoute, Zone } from '@/types/cloudflare'
 
 /** 优选回源域名候选 */
 export const PREFERRED_ORIGIN_DOMAINS = ['cdn.cnno.de', 'cdn.ddeed.de'] as const
@@ -34,12 +35,15 @@ export interface AccelerateConfig {
   originDomain: string
   /** Worker 脚本名称 */
   workerName: string
+  /** 访问域名所属 zone id（表单已选定时直传；不传则按域名反查） */
+  zoneId?: string
 }
 
 /** 已加速域名探测结果 */
 export interface AcceleratedZone {
   zone: Zone
   record: DNSRecord
+  /** 真实 Worker 名（以路由 script 为准，找不到路由时回退命名约定推导） */
   workerName: string
   /** Worker 脚本是否真实存在 */
   accelerated: boolean
@@ -58,6 +62,15 @@ export interface DeployProgress {
 /*                              Worker 脚本生成                                */
 /* -------------------------------------------------------------------------- */
 
+/** 简单字符串 hash，输出 6 位 base36 后缀（截断防撞名用，无需引库） */
+function hash6(s: string): string {
+  let h = 0
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 31 + s.charCodeAt(i)) | 0
+  }
+  return (h >>> 0).toString(36).padStart(6, '0').slice(-6)
+}
+
 /**
  * 根据访问域名生成 Worker 名称。
  * 规则：accel-{访问域名，点替换为连字符}，符合 CF 脚本命名规范（[a-zA-Z0-9_-]，≤63）。
@@ -65,8 +78,9 @@ export interface DeployProgress {
 export function generateWorkerName(accessDomain: string): string {
   const slug = accessDomain.toLowerCase().replace(/[^a-z0-9.-]/g, '').replace(/\./g, '-')
   const name = `accel-${slug}`
-  // Cloudflare 脚本名最长 63 字符，截断保留前缀
-  return name.length > 63 ? name.slice(0, 63) : name
+  // Cloudflare 脚本名最长 63 字符；截断时附完整域名 hash 后缀，避免不同长域名截断撞名（删除时误伤）
+  if (name.length <= 63) return name
+  return `${name.slice(0, 56)}-${hash6(normalizeDomain(accessDomain))}`
 }
 
 /**
@@ -157,7 +171,7 @@ export default {
 
 /** 列出账号下所有 zone */
 export async function listAcceleratedZones(): Promise<Zone[]> {
-  return zonesApi.list({ per_page: 50 })
+  return zonesApi.listAll()
 }
 
 /** 规范化域名字符串用于匹配（去尾部点、转小写） */
@@ -169,7 +183,8 @@ function normalizeDomain(s: string): string {
  * 探测账号下已加速的域名。
  *
  * 对每个 zone 列出 CNAME 记录，匹配 content 指向优选回源域名的记录；
- * 再校验按命名约定推导出的 Worker 脚本是否存在。
+ * Worker 名以路由为准：在该 zone 的 workers/routes 里找 pattern 匹配 `host/*` 的路由，
+ * 取其 script 作为真实 Worker 名（自定义命名的部署也能识别），找不到路由才回退按命名约定推导。
  *
  * @param zones zone 列表
  * @param originDomains 优选回源域名集合，默认 PREFERRED_ORIGIN_DOMAINS
@@ -191,48 +206,67 @@ export async function detectAccelerated(
     scripts = new Set()
   }
 
-  const results: AcceleratedZone[] = []
-  for (const zone of zones) {
-    let records: DNSRecord[] = []
-    try {
-      records = await dnsApi.list(zone.id, { type: 'CNAME' })
-    } catch {
-      continue
-    }
-    // 预取该 zone 的 custom hostnames，命中 hostname 的记录归 SaaS 优选管，排除避免误判为加速记录
-    let saasHostnames = new Set<string>()
-    try {
-      const hosts = await listCustomHostnames(zone.id)
-      saasHostnames = new Set(hosts.map((h) => normalizeDomain(h.hostname)))
-    } catch {
-      // 取不到 custom hostnames 时降级：不排除（保持旧行为）
-    }
-    for (const record of records) {
-      const content = normalizeDomain(record.content)
-      const hit = domains.some((d) => content === d || content.endsWith('.' + d))
-      if (!hit) continue
-      // 已是 SaaS 优选 custom hostname 的访问域名，跳过（避免误判为 Worker 缺失的加速记录）
-      if (saasHostnames.has(normalizeDomain(record.name))) continue
-      const workerName = generateWorkerName(record.name)
-      results.push({
-        zone,
-        record,
-        workerName,
-        accelerated: scripts.has(workerName),
-      })
-    }
-  }
-  return results
+  // 各 zone 并发探测；DNS 记录走翻页拉全量，避免默认 100 条截断漏检
+  const perZone = await Promise.all(
+    zones.map(async (zone): Promise<AcceleratedZone[]> => {
+      let records: DNSRecord[] = []
+      try {
+        records = await listAll<DNSRecord>(
+          `/zones/${zone.id}/dns_records`,
+          { type: 'CNAME' },
+          { perPage: 100 },
+        )
+      } catch {
+        return []
+      }
+      // 预取该 zone 的 custom hostnames，命中 hostname 的记录归 SaaS 优选管，排除避免误判为加速记录
+      let saasHostnames = new Set<string>()
+      try {
+        const hosts = await listCustomHostnames(zone.id)
+        saasHostnames = new Set(hosts.map((h) => normalizeDomain(h.hostname)))
+      } catch {
+        // 取不到 custom hostnames 时降级：不排除（保持旧行为）
+      }
+      // 预取该 zone 的 Worker 路由，按 `host/*` pattern 反查真实 Worker 名（自定义命名的部署不断链）
+      let routes: WorkerRoute[] = []
+      try {
+        routes = await workersApi.listRoutes(zone.id)
+      } catch {
+        // 取不到路由时降级：回退按命名约定推导
+      }
+      const found: AcceleratedZone[] = []
+      for (const record of records) {
+        const content = normalizeDomain(record.content)
+        const hit = domains.some((d) => content === d || content.endsWith('.' + d))
+        if (!hit) continue
+        // 已是 SaaS 优选 custom hostname 的访问域名，跳过（避免误判为 Worker 缺失的加速记录）
+        if (saasHostnames.has(normalizeDomain(record.name))) continue
+        // 以路由为准取真实 Worker 名，找不到匹配路由才回退推导名
+        const route = routes.find((r) => normalizeDomain(r.pattern) === `${normalizeDomain(record.name)}/*`)
+        const workerName = route?.script || generateWorkerName(record.name)
+        found.push({
+          zone,
+          record,
+          workerName,
+          accelerated: scripts.has(workerName),
+        })
+      }
+      return found
+    }),
+  )
+  return perZone.flat()
 }
 
-/** 找到 accessDomain 所属的 zone */
+/** 找到 accessDomain 所属的 zone（父子 zone 并存时取 name 最长的最精确命中） */
 function findZoneForAccessDomain(zones: Zone[], accessDomain: string): Zone | undefined {
   const host = normalizeDomain(accessDomain)
-  // 精确匹配 zone name 或访问域名以 .{zone.name} 结尾
-  return zones.find((z) => {
+  let best: Zone | undefined
+  for (const z of zones) {
     const zname = normalizeDomain(z.name)
-    return host === zname || host.endsWith('.' + zname)
-  })
+    if (host !== zname && !host.endsWith('.' + zname)) continue
+    if (!best || zname.length > normalizeDomain(best.name).length) best = z
+  }
+  return best
 }
 
 /**
@@ -253,36 +287,141 @@ export async function deployAccelerate(
 ): Promise<{ zone: Zone; record: DNSRecord; workerName: string }> {
   const { accessDomain, originUrl, originDomain, workerName } = config
 
-  const zones = await zonesApi.list({ per_page: 50 })
-  const zone = findZoneForAccessDomain(zones, accessDomain)
-  if (!zone) {
-    throw new Error(`未找到访问域名 ${accessDomain} 所属的 zone，请先在 Cloudflare 添加该域名`)
+  // ① 确定访问域名所属 zone：优先用调用方指定的 zoneId（校验域名归属），未指定才按域名反查
+  let zone: Zone
+  if (config.zoneId) {
+    zone = await zonesApi.get(config.zoneId)
+    const host = normalizeDomain(accessDomain)
+    const zname = normalizeDomain(zone.name)
+    if (host !== zname && !host.endsWith('.' + zname)) {
+      throw new Error(`访问域名 ${accessDomain} 不属于所选 zone ${zone.name}`)
+    }
+  } else {
+    const zones = await zonesApi.listAll()
+    const found = findZoneForAccessDomain(zones, accessDomain)
+    if (!found) {
+      throw new Error(`未找到访问域名 ${accessDomain} 所属的 zone，请先在 Cloudflare 添加该域名`)
+    }
+    zone = found
   }
 
-  // ① 上传 Worker 脚本
+  // 记录脚本是否在本次部署前已存在（失败回滚时只删本次新建的脚本，避免误伤既有脚本）
+  let scriptExistedBefore = true
+  try {
+    const list = await workersApi.listScripts()
+    scriptExistedBefore = list.some((s) => s.id === workerName)
+  } catch {
+    // 查不到清单时保守视为已存在（回滚时不删）
+  }
+
+  // 覆盖既有脚本前先备份旧代码，供后续步骤失败时恢复（备份失败则回滚时跳过恢复并注明）
+  let scriptBackup: string | null = null
+  if (scriptExistedBefore) {
+    try {
+      scriptBackup = await workersApi.getScriptContent(workerName)
+    } catch {
+      scriptBackup = null
+    }
+  }
+
+  // ② 上传 Worker 脚本
   onProgress?.({ step: 'upload', message: '正在上传 Worker 脚本…', ok: true })
   const script = generateWorkerScript(originUrl, config.cacheTtl)
   await workersApi.uploadScript(workerName, script)
 
-  // ② 创建 Worker 路由
-  onProgress?.({ step: 'dns', message: '正在配置 Worker 路由…', ok: true })
-  try {
-    await workersApi.createRoute(zone.id, `${accessDomain}/*`, workerName)
-  } catch (e) {
-    // 路由可能已存在，忽略错误继续尝试
-    onProgress?.({
-      step: 'dns',
-      message: `Worker 路由创建跳过：${e instanceof Error ? e.message : String(e)}`,
-      ok: false,
-    })
+  /**
+   * 失败回滚：本次新建的脚本直接删除；覆盖的既有脚本用备份重新上传恢复。
+   * 尽力而为，返回需附加进错误信息的说明（空串 = 无需说明）。
+   */
+  const rollbackScript = async (): Promise<string> => {
+    if (!scriptExistedBefore) {
+      try {
+        await workersApi.deleteScript(workerName)
+      } catch {
+        // 回滚失败不再上抛，保留原始错误
+      }
+      return ''
+    }
+    if (scriptBackup == null) return '（既有脚本备份失败，未恢复旧代码）'
+    try {
+      await workersApi.uploadScript(workerName, scriptBackup)
+      return ''
+    } catch {
+      return '（既有脚本恢复失败，当前仍为新代码）'
+    }
   }
 
-  // ③ 创建/更新 CNAME 指向优选回源域名
-  let record: DNSRecord
+  // ③ 创建 Worker 路由：命中 duplicate 时查同 pattern 既有路由——
+  //    script 与目标一致则跳过；指向其他 Worker 则更新其 script；找不到同 pattern 按原错误上抛
+  onProgress?.({ step: 'dns', message: '正在配置 Worker 路由…', ok: true })
+  const routePattern = `${accessDomain}/*`
   try {
-    const existing = await dnsApi.list(zone.id, { type: 'CNAME', name: accessDomain })
-    if (existing.length > 0) {
-      record = await dnsApi.update(zone.id, existing[0].id, {
+    await workersApi.createRoute(zone.id, routePattern, workerName)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    const isDuplicate =
+      (e instanceof CFError && e.code === 10020) || /already exists|duplicate|已存在/i.test(msg)
+    if (!isDuplicate) {
+      const note = await rollbackScript()
+      throw new Error(`Worker 路由创建失败：${msg}${note}`)
+    }
+    let handled = false
+    try {
+      const routes = await workersApi.listRoutes(zone.id)
+      const same = routes.find((r) => r.pattern === routePattern)
+      if (same) {
+        if (same.script === workerName) {
+          onProgress?.({ step: 'dns', message: 'Worker 路由已存在，跳过创建', ok: true })
+        } else {
+          // 既有路由指向其他 Worker：PUT 更新其 script 指向新 Worker（workers.ts 无对应方法，直接走 http）
+          await http.put<WorkerRoute>(`/zones/${zone.id}/workers/routes/${same.id}`, {
+            body: { pattern: routePattern, script: workerName },
+          })
+          onProgress?.({ step: 'dns', message: '已更新既有路由指向新 Worker', ok: true })
+        }
+        handled = true
+      }
+    } catch (e2) {
+      const note = await rollbackScript()
+      throw new Error(`Worker 路由更新失败：${e2 instanceof Error ? e2.message : String(e2)}${note}`)
+    }
+    if (!handled) {
+      // 报了 duplicate 却找不到同 pattern 路由，按原错误上抛
+      const note = await rollbackScript()
+      throw new Error(`Worker 路由创建失败：${msg}${note}`)
+    }
+  }
+
+  // ④ 创建/更新 CNAME 指向优选回源域名
+  //    部署意图就是把域名指向加速入口：同名 A/AAAA 冲突记录先删除再建（否则 CNAME 必失败）；
+  //    删除前保存完整 payload，新 CNAME 失败时依次重建被删记录，不让域名解析处于真空态
+  let record: DNSRecord
+  const deletedPayloads: DNSRecordPayload[] = []
+  try {
+    const sameName = await dnsApi.list(zone.id, { name: accessDomain })
+    const conflicts = sameName.filter((r) => r.type === 'A' || r.type === 'AAAA' || r.type === 'CNAME')
+    const existingCname = conflicts.find((r) => r.type === 'CNAME')
+    const toDelete = conflicts.filter((r) => r.id !== existingCname?.id)
+    // 逐条删除，成功一条记一条 payload（部分失败时只重建真正被删的，避免恢复出重复记录）
+    for (const r of toDelete) {
+      const payload: DNSRecordPayload = {
+        type: r.type,
+        name: r.name,
+        content: r.content,
+        ttl: r.ttl,
+        proxied: r.proxied,
+        comment: r.comment,
+      }
+      if (r.priority != null) payload.priority = r.priority
+      await dnsApi.delete(zone.id, r.id)
+      deletedPayloads.push(payload)
+    }
+    if (toDelete.length > 0) {
+      const types = [...new Set(toDelete.map((r) => r.type))].join('/')
+      onProgress?.({ step: 'dns', message: `已替换原有 ${types} 记录`, ok: true })
+    }
+    if (existingCname) {
+      record = await dnsApi.update(zone.id, existingCname.id, {
         type: 'CNAME',
         name: accessDomain,
         content: originDomain,
@@ -299,8 +438,24 @@ export async function deployAccelerate(
       })
     }
   } catch (e) {
-    // CNAME 失败不阻断（脚本与路由已就位），但向上抛出明确提示
-    throw new Error(`CNAME 配置失败：${e instanceof Error ? e.message : String(e)}（Worker 脚本与路由已创建）`)
+    // CNAME 失败不阻断（脚本与路由已就位），尽力重建被删记录后向上抛出明确提示
+    const restoreFailed: string[] = []
+    for (const p of deletedPayloads) {
+      try {
+        await dnsApi.create(zone.id, p)
+      } catch {
+        restoreFailed.push(`${p.type} ${p.name}`)
+      }
+    }
+    let extra = ''
+    if (deletedPayloads.length > 0) {
+      extra = restoreFailed.length
+        ? `；被删记录恢复失败：${restoreFailed.join('、')}`
+        : '；已恢复被删除的原记录'
+    }
+    throw new Error(
+      `CNAME 配置失败：${e instanceof Error ? e.message : String(e)}（Worker 脚本与路由已创建）${extra}`,
+    )
   }
 
   onProgress?.({ step: 'done', message: '部署完成', ok: true })
