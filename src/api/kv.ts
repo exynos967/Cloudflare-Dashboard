@@ -1,4 +1,4 @@
-import { http } from './client'
+import { http, listAll } from './client'
 import { useAuthStore } from '@/stores/auth'
 import type { KVNamespace, KVKey } from '@/types/cloudflare'
 
@@ -29,9 +29,9 @@ async function readError(res: Response): Promise<string> {
 }
 
 export const kvApi = {
-  /** 列出账号下所有 KV 命名空间 */
+  /** 列出账号下所有 KV 命名空间（CF 默认每页 20 条，自动翻页拉全量） */
   listNamespaces: () =>
-    http.get<KVNamespace[]>(`/accounts/${accountId()}/storage/kv/namespaces`),
+    listAll<KVNamespace>(`/accounts/${accountId()}/storage/kv/namespaces`),
 
   /** 创建命名空间 */
   createNamespace: (title: string) =>

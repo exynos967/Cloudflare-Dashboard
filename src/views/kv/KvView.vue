@@ -74,6 +74,7 @@ function openNsCreate() {
 }
 
 async function submitNsCreate() {
+  if (nsCreating.value) return // 防 Enter/连点重复提交
   const title = nsTitle.value.trim()
   if (!title) {
     toast.error('请填写命名空间名称')
@@ -94,6 +95,7 @@ async function submitNsCreate() {
 }
 
 async function doDeleteNs() {
+  if (nsDeleting.value) return // 防重复提交
   if (!nsDeleteTarget.value) return
   nsDeleting.value = true
   try {
@@ -149,7 +151,6 @@ interface KeyFormState {
   value: string
   ttl: string
   loading: boolean
-  // 仅 create 模式可见的 ttl 控件
 }
 
 const form = ref<KeyFormState>({
@@ -181,8 +182,12 @@ function openCreateKey() {
   }
 }
 
+// getValue 请求序号守卫：连续打开不同键的编辑/查看时，丢弃旧请求迟到的响应
+let valueSeq = 0
+
 async function openEditKey(k: KVKey) {
   if (!currentNs.value) return
+  const seq = ++valueSeq
   form.value = {
     open: true,
     mode: 'edit',
@@ -193,14 +198,18 @@ async function openEditKey(k: KVKey) {
     loading: false,
   }
   try {
-    form.value.value = await kvApi.getValue(currentNs.value.id, k.name)
+    const v = await kvApi.getValue(currentNs.value.id, k.name)
+    if (seq !== valueSeq) return
+    form.value.value = v
   } catch (e) {
+    if (seq !== valueSeq) return
     toast.error('读取值失败', { description: e instanceof Error ? e.message : String(e) })
     form.value.open = false
   }
 }
 
 async function submitKeyForm() {
+  if (form.value.loading) return // 防 Enter/连点重复提交
   if (!currentNs.value) return
   if (keyError.value) {
     toast.error(keyError.value)
@@ -256,6 +265,7 @@ const viewerDisplay = computed(() => {
 
 async function openViewer(k: KVKey) {
   if (!currentNs.value) return
+  const seq = ++valueSeq
   viewer.value = {
     open: true,
     loading: true,
@@ -265,6 +275,7 @@ async function openViewer(k: KVKey) {
   }
   try {
     const v = await kvApi.getValue(currentNs.value.id, k.name)
+    if (seq !== valueSeq) return
     viewer.value.value = v
     // 尝试自动 json 检测
     try {
@@ -274,10 +285,11 @@ async function openViewer(k: KVKey) {
       viewer.value.mode = 'text'
     }
   } catch (e) {
+    if (seq !== valueSeq) return
     toast.error('读取值失败', { description: e instanceof Error ? e.message : String(e) })
     viewer.value.open = false
   } finally {
-    viewer.value.loading = false
+    if (seq === valueSeq) viewer.value.loading = false
   }
 }
 
@@ -286,6 +298,7 @@ const deleteKeyTarget = ref<KVKey | null>(null)
 const deletingKey = ref(false)
 
 async function doDeleteKey() {
+  if (deletingKey.value) return // 防重复提交
   if (!currentNs.value || !deleteKeyTarget.value) return
   deletingKey.value = true
   try {
@@ -310,8 +323,10 @@ function fmtExp(ts?: number): string {
   }
 }
 
-function refreshAll() {
-  loadNamespaces()
+async function refreshAll() {
+  await loadNamespaces()
+  // nsId 未变化时 watch 不会触发，这里显式刷新键列表
+  await loadKeys()
 }
 
 function copyValue() {
@@ -564,7 +579,7 @@ function copyValue() {
               placeholder="可存放任意文本，如配置、JSON、HTML 片段等"
             />
           </div>
-          <div v-if="form.mode === 'create'" class="space-y-1.5">
+          <div class="space-y-1.5">
             <Label for="kv-ttl">过期时间（秒，可选）</Label>
             <Input
               id="kv-ttl"
