@@ -12,6 +12,14 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -48,6 +56,8 @@ const name = computed(() => props.scriptName ?? '')
 // 代码
 const code = ref('')
 const codeLoading = ref(false)
+/** 代码是否已成功加载（加载中/失败时禁止保存，防止空代码覆盖线上脚本） */
+const codeLoaded = ref(false)
 const saving = ref(false)
 
 // zones
@@ -77,22 +87,36 @@ const newDomainZone = ref<string>('')
 const newHostname = ref('')
 const addingDomain = ref(false)
 
+// 删除确认
+const deleteOpen = ref(false)
+const deleting = ref(false)
+
+// 请求序号：快速切换 Worker 时丢弃过期响应，避免 A 的代码覆盖 B
+let codeSeq = 0
+
 async function loadCode() {
   if (!name.value) return
+  const seq = ++codeSeq
   codeLoading.value = true
+  codeLoaded.value = false
+  code.value = ''
   try {
-    code.value = await workersApi.getScriptContent(name.value)
+    const text = await workersApi.getScriptContent(name.value)
+    if (seq !== codeSeq) return
+    code.value = text
+    codeLoaded.value = true
   } catch (e) {
+    if (seq !== codeSeq) return
     toast.error('读取脚本失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
-    codeLoading.value = false
+    if (seq === codeSeq) codeLoading.value = false
   }
 }
 
 async function loadZones() {
   zonesLoading.value = true
   try {
-    zones.value = await zonesApi.list({ per_page: 50 })
+    zones.value = await zonesApi.listAll()
     if (zones.value.length && !selectedZoneId.value) selectedZoneId.value = zones.value[0].id
     if (zones.value.length && !newDomainZone.value) newDomainZone.value = zones.value[0].id
   } catch (e) {
@@ -110,8 +134,9 @@ async function loadSubdomain() {
     const st = await workersApi.getSubdomainStatus(name.value)
     subdomainEnabled.value = st.enabled
   } catch (e) {
-    // 未开通 workers.dev 子域时静默
+    // 未开通 workers.dev 子域时静默；同步清掉启用态，避免上一脚本状态残留
     subdomain.value = ''
+    subdomainEnabled.value = false
   } finally {
     subdomainLoading.value = false
   }
@@ -151,7 +176,14 @@ async function loadAll() {
 watch(
   () => [props.open, props.scriptName] as const,
   ([isOpen, n]) => {
-    if (isOpen && n) loadAll()
+    if (isOpen && n) {
+      // 切换脚本时先重置状态再加载，避免上一脚本的数据残留
+      routes.value = []
+      domains.value = []
+      subdomain.value = ''
+      subdomainEnabled.value = false
+      loadAll()
+    }
   },
   { immediate: true },
 )
@@ -243,14 +275,18 @@ async function deleteDomain(domainId: string) {
 }
 
 async function deleteSelf() {
-  if (!name.value) return
+  if (!name.value || deleting.value) return
+  deleting.value = true
   try {
     await workersApi.deleteScript(name.value)
     toast.success('Worker 已删除')
+    deleteOpen.value = false
     emit('deleted')
     emit('update:open', false)
   } catch (e) {
     toast.error('删除失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    deleting.value = false
   }
 }
 
@@ -280,7 +316,7 @@ function zoneName(id: string): string {
           <TabsContent value="code" class="space-y-3">
             <div class="flex items-center justify-between">
               <p class="text-sm text-muted-foreground">修改后点击保存即立即重新部署</p>
-              <Button size="sm" :disabled="saving || codeLoading" @click="saveCode">
+              <Button size="sm" :disabled="saving || codeLoading || !codeLoaded" @click="saveCode">
                 <Save class="size-4" />
                 {{ saving ? '部署中…' : '保存部署' }}
               </Button>
@@ -488,11 +524,29 @@ function zoneName(id: string): string {
 
       <!-- 底部 -->
       <div class="flex items-center justify-end gap-2 border-t px-6 py-3">
-        <Button variant="destructive" size="sm" @click="deleteSelf">
+        <Button variant="destructive" size="sm" @click="deleteOpen = true">
           <Trash2 class="size-4" />
           删除此 Worker
         </Button>
       </div>
     </SheetContent>
   </Sheet>
+
+  <!-- 删除确认 -->
+  <Dialog v-model:open="deleteOpen">
+    <DialogContent class="sm:max-w-md">
+      <DialogHeader>
+        <DialogTitle>删除 Worker</DialogTitle>
+        <DialogDescription>
+          确定删除脚本 <code class="rounded bg-muted px-1 font-mono">{{ name }}</code>？该操作不可撤销，关联的路由与自定义域将被解除绑定。
+        </DialogDescription>
+      </DialogHeader>
+      <DialogFooter>
+        <Button variant="outline" @click="deleteOpen = false">取消</Button>
+        <Button variant="destructive" :disabled="deleting" @click="deleteSelf">
+          {{ deleting ? '删除中…' : '确认删除' }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
 </template>

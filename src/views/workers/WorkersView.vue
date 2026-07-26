@@ -34,7 +34,8 @@ const DEFAULT_TEMPLATE = `export default {
 }
 `
 
-const NAME_RE = /^[a-z][a-z0-9-]*$/
+// CF 规则：小写字母/数字/连字符，不以连字符结尾（workers.dev 场景下最长 63 字符）
+const NAME_RE = /^[a-z]([a-z0-9-]*[a-z0-9])?$/
 
 const scripts = ref<WorkerScriptMeta[]>([])
 const loading = ref(true)
@@ -46,7 +47,8 @@ const createCode = ref(DEFAULT_TEMPLATE)
 const creating = ref(false)
 const nameError = computed(() => {
   if (!createName.value) return ''
-  if (!NAME_RE.test(createName.value)) return '仅支持小写字母、数字、连字符，且以字母开头'
+  if (createName.value.length > 63) return '最长 63 个字符'
+  if (!NAME_RE.test(createName.value)) return '仅支持小写字母、数字、连字符，须以字母开头且不能以连字符结尾'
   return ''
 })
 
@@ -231,7 +233,7 @@ function fmtDate(s: string): string {
               autocomplete="off"
             />
             <p class="text-xs" :class="nameError ? 'text-destructive' : 'text-muted-foreground'">
-              {{ nameError || '小写字母开头，仅含小写字母、数字、连字符' }}
+              {{ nameError || '小写字母开头，仅含小写字母、数字、连字符，不以连字符结尾，最长 63 字符' }}
             </p>
           </div>
           <div class="space-y-1.5">

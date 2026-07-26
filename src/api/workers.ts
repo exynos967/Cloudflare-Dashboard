@@ -1,4 +1,4 @@
-import { http, authHeaders } from './client'
+import { http, authHeaders, listAll, CFError } from './client'
 import { useAuthStore } from '@/stores/auth'
 import type { WorkerDomain, WorkerRoute, WorkersSubdomain } from '@/types/cloudflare'
 
@@ -20,6 +20,13 @@ export interface WorkerScriptMeta {
   handlers: string[]
 }
 
+/** GET /workers/scripts/{name}/settings 返回的既有脚本配置（部分字段） */
+interface WorkerScriptSettings {
+  bindings?: { type: string; name?: string }[] | null
+  compatibility_date?: string | null
+  compatibility_flags?: string[] | null
+}
+
 export const workersApi = {
   /** 列出账号下所有 Worker 脚本元数据 */
   listScripts: () => http.get<WorkerScriptMeta[]>(`/accounts/${accountId()}/workers/scripts`),
@@ -27,7 +34,7 @@ export const workersApi = {
   /** 读取脚本源码（返回纯文本） */
   getScriptContent: async (scriptName: string): Promise<string> => {
     const res = await fetch(
-      `${BASE}/accounts/${accountId()}/workers/scripts/${scriptName}`,
+      `${BASE}/accounts/${accountId()}/workers/scripts/${encodeURIComponent(scriptName)}`,
       { headers: { ...authHeaders(), Accept: 'application/javascript' } },
     )
     if (!res.ok) throw new Error(`读取脚本失败（HTTP ${res.status}）`)
@@ -38,19 +45,42 @@ export const workersApi = {
    * 上传/更新脚本（ES Module 格式）。
    *
    * CF Upload Worker Module 端点要求 multipart/form-data：
-   *   - part `metadata`（application/json）：{ main_module, compatibility_date }
+   *   - part `metadata`（application/json）：{ main_module, compatibility_date, ... }
    *   - part 名 = main_module 的值（application/javascript+module）：脚本源码
    * 顶层 Content-Type 由 FormData 自动设为 multipart/form-data，禁止手动指定。
+   *
+   * PUT 为全量替换：更新既有脚本前先读 settings，用 metadata.keep_bindings
+   * （按 binding 的 type 列表保留，含 secret_text 等不回传明文的类型）保留全部
+   * 既有 bindings，并回传原 compatibility_date / compatibility_flags，避免清空配置。
    */
   uploadScript: async (scriptName: string, script: string): Promise<void> => {
     const mainModule = 'worker.js'
+
+    // 读取既有脚本配置；404 = 新脚本；其他错误直接抛出，避免误清空既有配置
+    let settings: WorkerScriptSettings | null = null
+    try {
+      settings = await http.get<WorkerScriptSettings>(
+        `/accounts/${accountId()}/workers/scripts/${encodeURIComponent(scriptName)}/settings`,
+      )
+    } catch (e) {
+      if (!(e instanceof CFError && e.status === 404)) throw e
+    }
+
+    const metadata: Record<string, unknown> = { main_module: mainModule }
+    if (settings) {
+      const keepTypes = [...new Set((settings.bindings ?? []).map((b) => b.type))]
+      if (keepTypes.length) metadata.keep_bindings = keepTypes
+      if (settings.compatibility_date) metadata.compatibility_date = settings.compatibility_date
+      if (settings.compatibility_flags?.length) metadata.compatibility_flags = settings.compatibility_flags
+    } else {
+      // 新脚本才使用默认 compatibility_date
+      metadata.compatibility_date = '2024-11-01'
+    }
+
     const form = new FormData()
     form.append(
       'metadata',
-      new Blob(
-        [JSON.stringify({ main_module: mainModule, compatibility_date: '2024-11-01' })],
-        { type: 'application/json' },
-      ),
+      new Blob([JSON.stringify(metadata)], { type: 'application/json' }),
     )
     // CF 用 part 的 filename（非 field name）识别 module，必须显式传 filename
     form.append(
@@ -59,7 +89,7 @@ export const workersApi = {
       mainModule,
     )
     const res = await fetch(
-      `${BASE}/accounts/${accountId()}/workers/scripts/${scriptName}`,
+      `${BASE}/accounts/${accountId()}/workers/scripts/${encodeURIComponent(scriptName)}`,
       {
         method: 'PUT',
         headers: authHeaders(),
@@ -73,17 +103,17 @@ export const workersApi = {
   },
 
   deleteScript: (scriptName: string) =>
-    http.delete<void>(`/accounts/${accountId()}/workers/scripts/${scriptName}`),
+    http.delete<void>(`/accounts/${accountId()}/workers/scripts/${encodeURIComponent(scriptName)}`),
 
   /* ---------- workers.dev 子域 ---------- */
 
   getSubdomain: () => http.get<WorkersSubdomain>(`/accounts/${accountId()}/workers/subdomain`),
 
   getSubdomainStatus: (scriptName: string) =>
-    http.get<{ enabled: boolean }>(`/accounts/${accountId()}/workers/scripts/${scriptName}/subdomain`),
+    http.get<{ enabled: boolean }>(`/accounts/${accountId()}/workers/scripts/${encodeURIComponent(scriptName)}/subdomain`),
 
   setSubdomainStatus: (scriptName: string, enabled: boolean) =>
-    http.post<unknown>(`/accounts/${accountId()}/workers/scripts/${scriptName}/subdomain`, {
+    http.post<unknown>(`/accounts/${accountId()}/workers/scripts/${encodeURIComponent(scriptName)}/subdomain`, {
       body: { enabled },
     }),
 
@@ -99,10 +129,11 @@ export const workersApi = {
 
   /* ---------- 自定义域（account 维度） ---------- */
 
-  listDomains: () => http.get<WorkerDomain[]>(`/accounts/${accountId()}/workers/domains`),
+  listDomains: () => listAll<WorkerDomain>(`/accounts/${accountId()}/workers/domains`),
 
+  // Attach to Domain 端点是 PUT（POST 会 405）
   createDomain: (data: { hostname: string; service: string; environment?: string; zone_id: string }) =>
-    http.post<WorkerDomain>(`/accounts/${accountId()}/workers/domains`, {
+    http.put<WorkerDomain>(`/accounts/${accountId()}/workers/domains`, {
       body: { environment: 'production', ...data },
     }),
 
