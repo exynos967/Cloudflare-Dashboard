@@ -31,10 +31,16 @@ export const d1Api = {
   query: (uuid: string, sql: string, params?: unknown[]) =>
     http.post<D1QueryResult[]>(dbBase(uuid) + '/query', { body: { sql, params } }),
 
-  /** 列出当前数据库的所有表名（按名排序） */
+  /** 列出当前数据库的所有表名（按名排序，过滤 sqlite_ / _cf_ 内部表） */
   listTables: (uuid: string) =>
     d1Api
-      .query(uuid, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+      .query(
+        uuid,
+        "SELECT name FROM sqlite_master WHERE type='table'" +
+          " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'" +
+          " AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'" +
+          ' ORDER BY name',
+      )
       .then((rs) => {
         const r = rs[0]?.results ?? []
         return r.map((row) => String(row.name))

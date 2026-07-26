@@ -234,7 +234,8 @@ function parseParams(): unknown[] | undefined {
   }
 }
 
-async function runQuery() {
+async function runQuery(confirmed = false) {
+  if (running.value) return // 防重复执行
   if (!selected.value) return
   const code = sql.value.trim()
   if (!code) {
@@ -248,8 +249,8 @@ async function runQuery() {
     toast.error('参数解析失败', { description: e instanceof Error ? e.message : String(e) })
     return
   }
-  // 危险语句二次确认
-  if (DANGER_RE.test(code) && !confirmSqlOpen.value) {
+  // 危险语句二次确认：未确认时只弹窗，由确认按钮以 confirmed=true 重入
+  if (DANGER_RE.test(code) && !confirmed) {
     confirmSqlOpen.value = true
     return
   }
@@ -258,9 +259,9 @@ async function runQuery() {
   error.value = ''
   results.value = []
   try {
-    const rs = await d1Api.query(selected.value.uuid, code, params)
-    results.value = rs ?? []
-    activeResult.value = rs.length ? String(0) : '0'
+    const rs = (await d1Api.query(selected.value.uuid, code, params)) ?? []
+    results.value = rs
+    activeResult.value = '0'
     ranAt.value = new Date().toLocaleString('zh-CN', { hour12: false })
     const ok = rs.filter((r) => r.success).length
     toast.success(`执行完成，共 ${rs.length} 个结果集，成功 ${ok} 个`)
@@ -270,6 +271,12 @@ async function runQuery() {
   } finally {
     running.value = false
   }
+}
+
+/** SQL 编辑器快捷键：确认弹窗打开时忽略，避免绕过二次确认 */
+function onSqlShortcut() {
+  if (confirmSqlOpen.value) return
+  runQuery()
 }
 
 function resultColumns(r: D1QueryResult): string[] {
@@ -500,8 +507,8 @@ function displayVal(v: unknown): string {
                 class="min-h-40 font-mono text-xs leading-relaxed"
                 spellcheck="false"
                 placeholder="SELECT * FROM your_table LIMIT 100;"
-                @keydown.meta.enter.prevent="runQuery"
-                @keydown.ctrl.enter.prevent="runQuery"
+                @keydown.meta.enter.prevent="onSqlShortcut"
+                @keydown.ctrl.enter.prevent="onSqlShortcut"
               />
             </div>
 
@@ -518,7 +525,7 @@ function displayVal(v: unknown): string {
             </div>
 
             <div class="flex items-center gap-2">
-              <Button :disabled="running" @click="runQuery">
+              <Button :disabled="running" @click="runQuery()">
                 <Play class="size-4" />
                 {{ running ? '执行中…' : '执行' }}
               </Button>
@@ -712,7 +719,7 @@ function displayVal(v: unknown): string {
         </div>
         <DialogFooter>
           <Button variant="outline" @click="confirmSqlOpen = false">取消</Button>
-          <Button variant="destructive" :disabled="running" @click="runQuery">
+          <Button variant="destructive" :disabled="running" @click="runQuery(true)">
             {{ running ? '执行中…' : '确认执行' }}
           </Button>
         </DialogFooter>
