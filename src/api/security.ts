@@ -47,11 +47,12 @@ export interface CertificatePack {
   certificates: CertificatePackCert[]
 }
 
-/** WAF 访问规则 */
+/** WAF 访问规则（mode 枚举与官方一致，含托管质询） */
 export interface FirewallAccessRule {
   id: string
-  mode: 'block' | 'challenge' | 'whitelist' | 'js_challenge'
+  mode: 'block' | 'challenge' | 'whitelist' | 'js_challenge' | 'managed_challenge'
   notes: string
+  /** target 官方枚举：ip / ip6 / ip_range / asn / country */
   configuration: { target: string; value: string }
   scope?: { type: string; name?: string; id?: string }
   created_on: string
@@ -72,17 +73,6 @@ export interface RulesetRule {
 interface RulesetEntrypoint {
   id: string
   rules?: RulesetRule[]
-}
-
-/** WAF 规则集（account 维度） */
-export interface WafRuleset {
-  id: string
-  name: string
-  description?: string
-  kind: string
-  phase: string
-  version?: string
-  last_updated?: string
 }
 
 /** Page Rule 目标 */
@@ -159,11 +149,9 @@ export const securityApi = {
       body: { value: enabled ? 'on' : 'off' },
     }),
 
-  /** 列出 zone 下所有证书包（Universal/Custom/Advanced），?status=all 返回全部状态 */
+  /** 列出 zone 下所有证书包（Universal/Custom/Advanced），?status=all 返回全部状态；自动翻页 */
   listCerts: (zoneId: string) =>
-    http.get<CertificatePack[]>(`/zones/${zoneId}/ssl/certificate_packs`, {
-      params: { status: 'all' },
-    }),
+    listAll<CertificatePack>(`/zones/${zoneId}/ssl/certificate_packs`, { status: 'all' }),
 
   /* --------------------------- WAF / 防火墙 ------------------------------ */
 
@@ -186,11 +174,6 @@ export const securityApi = {
   /** WAF 自定义规则（Rulesets API；旧 Firewall Rules API 已于 2025-06-15 停服） */
   listFirewallRules: (zoneId: string) =>
     listPhaseRules(zoneId, 'http_request_firewall_custom'),
-
-  listWafRulesets: (accountId: string) =>
-    http.get<WafRuleset[]>(`/accounts/${accountId}/rulesets`, {
-      params: { per_page: 50 },
-    }),
 
   /* ------------------------------ 缓存规则 ------------------------------ */
 
@@ -226,8 +209,8 @@ export const securityApi = {
  * 1. SettingDef 是 CF 原生维度（代码内置不变）：每项的 id / 取值类型 / 可选值，
  *    是「单项调节」与「预设编辑」共用的元数据。
  * 2. Preset 只存 { [settingId]: value } 的值映射 + 名称，用户可自由增删改、改名、
- *    持久化到 localStorage（见 stores/presets.ts）。内置「速度优先」「安全优先」
- *    两个预设只读不可改不可删。
+ *    持久化到 localStorage（见 stores/presets.ts）。视图另注入只读的「当前」
+ *    虚拟预设（id='current'）代表 zone 实况，不落盘。
  * 3. 应用预设 = 并发 PATCH 该预设内全部已配置项；单项调节 = 直接 PATCH 单项。
  *    单项失败（套餐不支持等）不阻断其余，最终聚合成功/失败清单。
  *
@@ -292,9 +275,10 @@ export const SETTING_DEFS: SettingDef[] = [
   /* 缓存 */
   {
     id: 'cache_level',
+    // CF API 合法值仅 aggressive/basic/simplified（无 off）
     label: '缓存级别',
     type: 'select',
-    options: ['off', 'simplified', 'aggressive', 'basic'],
+    options: ['simplified', 'aggressive', 'basic'],
     group: 'cache',
   },
   {
@@ -316,7 +300,7 @@ export const SETTING_DEFS: SettingDef[] = [
   /* 速度 */
   { id: 'brotli', label: 'Brotli 压缩', type: 'onoff', group: 'speed' },
   { id: 'early_hints', label: 'Early Hints', type: 'onoff', group: 'speed' },
-  { id: 'http3', label: 'HTTP/3 (QUIC)', type: 'onoff', requiresPro: true, group: 'speed' },
+  { id: 'http3', label: 'HTTP/3 (QUIC)', type: 'onoff', group: 'speed' },
   { id: '0rtt', label: '0-RTT 连接恢复', type: 'onoff', group: 'speed' },
 ]
 
@@ -346,7 +330,7 @@ export const OPTION_LABELS: Record<string, Record<string, string>> = {
     high: '高',
     under_attack: '正在遭受攻击',
   },
-  cache_level: { off: '关闭', simplified: '简化', aggressive: '标准', basic: '基本' },
+  cache_level: { simplified: '简化', aggressive: '标准', basic: '基本' },
   polish: { off: '关闭', lossless: '无损', lossy: '有损' },
   tls_1_3: { on: '开启', off: '关闭', zrt: '零往返时间恢复 (0-RTT)' },
   min_tls_version: { '1.0': 'TLS 1.0', '1.1': 'TLS 1.1', '1.2': 'TLS 1.2', '1.3': 'TLS 1.3' },
@@ -364,7 +348,7 @@ export function onoffLabel(value: unknown): string {
 
 /** 一个配置预设方案（用户可编辑、可持久化） */
 export interface OptimizationPreset {
-  /** 预设唯一 id：内置用 'builtin:speed'/'builtin:security'；用户预设用 'user_xxx' */
+  /** 预设唯一 id：视图注入的「当前」虚拟预设用 'current'；用户预设用 'user_xxx' */
   id: string
   /** 方案名（用户预设可改名） */
   name: string

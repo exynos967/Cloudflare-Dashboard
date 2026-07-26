@@ -1,18 +1,7 @@
 import { http, listAll } from './client'
 import type { Zone } from '@/types/cloudflare'
 
-export interface ListZonesParams {
-  page?: number
-  per_page?: number
-  name?: string
-  status?: string
-  account_id?: string
-}
-
 export const zonesApi = {
-  list: (params: ListZonesParams = {}) =>
-    http.get<Zone[]>('/zones', { params: { page: params.page ?? 1, per_page: params.per_page ?? 50, ...params } }),
-
   /** 拉取全量 zone：自动按 result_info.total_pages 翻完所有页（per_page 50） */
   listAll: (params: { name?: string; status?: string; account_id?: string } = {}) =>
     listAll<Zone>('/zones', params, { perPage: 50 }),

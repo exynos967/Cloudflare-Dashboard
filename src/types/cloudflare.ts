@@ -82,6 +82,8 @@ export interface DNSRecord {
   proxiable: boolean
   /** CF 托管锁定（如 Worker Custom Domain 绑定的记录，proxied 等不可改） */
   locked?: boolean
+  /** SRV/CAA/TLSA 等结构化记录的字段对象（content 仅为只读展示） */
+  data?: Record<string, unknown>
   comment?: string
   tags?: string[]
   created_on: string
@@ -91,7 +93,10 @@ export interface DNSRecord {
 export interface DNSRecordPayload {
   type: DNSRecordType
   name: string
-  content: string
+  /** 普通记录的值；SRV/CAA/TLSA 等结构化记录改用 data，不提交 content */
+  content?: string
+  /** SRV/CAA/TLSA 等结构化记录的字段对象 */
+  data?: Record<string, unknown>
   ttl?: number
   priority?: number
   proxied?: boolean
