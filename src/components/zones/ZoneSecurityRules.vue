@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { toast } from 'vue-sonner'
-import { RefreshCw, Loader2, ShieldAlert, Globe, Plus, Trash2, Flame, Layers } from '@lucide/vue'
+import { RefreshCw, Loader2, ShieldAlert, Globe, Plus, Trash2, Flame, Layers, ExternalLink } from '@lucide/vue'
 import { securityApi } from '@/api'
 import type {
   CertificatePack,
@@ -45,6 +45,7 @@ const props = defineProps<{ zoneId: string }>()
 
 const packs = ref<CertificatePack[]>([])
 const certsLoading = ref(false)
+const certsError = ref('')
 
 /** 扁平化证书行：pack + pack 内每个 cert */
 interface CertRow {
@@ -67,10 +68,12 @@ const certRows = computed<CertRow[]>(() =>
 async function loadCerts() {
   if (!props.zoneId) return
   certsLoading.value = true
+  certsError.value = ''
+  packs.value = [] // 加载前清空，避免失败时残留旧 zone 数据
   try {
     packs.value = await securityApi.listCerts(props.zoneId)
   } catch (e) {
-    toast.error('加载证书列表失败', { description: e instanceof Error ? e.message : String(e) })
+    certsError.value = e instanceof Error ? e.message : String(e)
   } finally {
     certsLoading.value = false
   }
@@ -94,14 +97,17 @@ function certStatusClass(s: string): string {
 
 const wafRules = ref<RulesetRule[]>([])
 const wafRulesLoading = ref(false)
+const wafRulesError = ref('')
 
 async function loadWafRules() {
   if (!props.zoneId) return
   wafRulesLoading.value = true
+  wafRulesError.value = ''
+  wafRules.value = []
   try {
     wafRules.value = await securityApi.listFirewallRules(props.zoneId)
   } catch (e) {
-    toast.error('加载 WAF 自定义规则失败', { description: e instanceof Error ? e.message : String(e) })
+    wafRulesError.value = e instanceof Error ? e.message : String(e)
   } finally {
     wafRulesLoading.value = false
   }
@@ -119,7 +125,7 @@ const WAF_ACTION_LABEL: Record<string, string> = {
 function wafActionClass(a: string): string {
   if (a === 'block') return 'bg-red-500/15 text-red-600'
   if (a.includes('challenge')) return 'bg-amber-500/15 text-amber-600'
-  if (a === 'skip') return 'bg-emerald-500/15 text-emerald-600'
+  // skip 是"跳过后续规则"而非放行，用中性色避免误读为安全放行
   return 'bg-muted text-muted-foreground'
 }
 
@@ -127,14 +133,17 @@ function wafActionClass(a: string): string {
 
 const cacheRules = ref<RulesetRule[]>([])
 const cacheRulesLoading = ref(false)
+const cacheRulesError = ref('')
 
 async function loadCacheRules() {
   if (!props.zoneId) return
   cacheRulesLoading.value = true
+  cacheRulesError.value = ''
+  cacheRules.value = []
   try {
     cacheRules.value = await securityApi.listCacheRules(props.zoneId)
   } catch (e) {
-    toast.error('加载缓存规则失败', { description: e instanceof Error ? e.message : String(e) })
+    cacheRulesError.value = e instanceof Error ? e.message : String(e)
   } finally {
     cacheRulesLoading.value = false
   }
@@ -144,14 +153,17 @@ async function loadCacheRules() {
 
 const accessRules = ref<FirewallAccessRule[]>([])
 const rulesLoading = ref(false)
+const rulesError = ref('')
 
 async function loadAccessRules() {
   if (!props.zoneId) return
   rulesLoading.value = true
+  rulesError.value = ''
+  accessRules.value = []
   try {
     accessRules.value = await securityApi.listAccessRules(props.zoneId)
   } catch (e) {
-    toast.error('加载访问规则失败', { description: e instanceof Error ? e.message : String(e) })
+    rulesError.value = e instanceof Error ? e.message : String(e)
   } finally {
     rulesLoading.value = false
   }
@@ -162,12 +174,13 @@ const MODE_LABEL: Record<string, string> = {
   challenge: '质询',
   whitelist: '允许',
   js_challenge: 'JS 质询',
+  managed_challenge: '托管质询',
 }
 
 function modeClass(m: string): string {
   if (m === 'block') return 'bg-red-500/15 text-red-600'
   if (m === 'whitelist') return 'bg-emerald-500/15 text-emerald-600'
-  if (m === 'challenge' || m === 'js_challenge') return 'bg-amber-500/15 text-amber-600'
+  if (m.includes('challenge')) return 'bg-amber-500/15 text-amber-600'
   return 'bg-muted text-muted-foreground'
 }
 
@@ -177,16 +190,25 @@ const addOpen = ref(false)
 const creating = ref(false)
 const form = ref({
   mode: 'block' as FirewallAccessRule['mode'],
-  target: 'ip' as 'ip' | 'ip_range' | 'country' | 'asn',
+  target: 'ip' as 'ip' | 'ip6' | 'ip_range' | 'country' | 'asn',
   value: '',
   notes: '',
 })
 
 const TARGET_LABEL: Record<string, string> = {
   ip: 'IP 地址',
+  ip6: 'IPv6 地址',
   ip_range: 'IP 段 (CIDR)',
   country: '国家代码',
   asn: 'ASN',
+}
+
+const TARGET_PLACEHOLDER: Record<string, string> = {
+  ip: '如 1.2.3.4',
+  ip6: '如 2001:db8::1',
+  ip_range: '如 1.2.3.0/24（IPv4 仅 /16、/24；IPv6 仅 /32、/48、/64）',
+  country: '如 CN',
+  asn: '如 AS13335',
 }
 
 function openAdd() {
@@ -194,12 +216,87 @@ function openAdd() {
   addOpen.value = true
 }
 
-async function submitAdd() {
+/** IPv4 严格校验：四段十进制，每段 0-255 */
+function isIPv4(s: string): boolean {
+  const parts = s.split('.')
+  return parts.length === 4 && parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255)
+}
+
+/** IPv6 简版校验：按 :: 拆分，段为 1-4 位 hex；无 :: 时须 8 段，有 :: 时最多 7 段 */
+function isIPv6(s: string): boolean {
+  const halves = s.split('::')
+  if (halves.length > 2) return false
+  const groups = halves.flatMap((h) => (h === '' ? [] : h.split(':')))
+  if (!groups.every((g) => /^[0-9a-fA-F]{1,4}$/.test(g))) return false
+  return halves.length === 2 ? groups.length <= 7 : groups.length === 8
+}
+
+/** 按目标类型校验并归一化规则值；非法时 toast 提示并返回 null */
+function normalizeRuleValue(): string | null {
   const v = form.value.value.trim()
   if (!v) {
     toast.error('请输入规则值')
-    return
+    return null
   }
+  const t = form.value.target
+  if (t === 'ip') {
+    if (!isIPv4(v)) {
+      toast.error('请输入合法的 IPv4 地址，如 1.2.3.4')
+      return null
+    }
+    return v
+  }
+  if (t === 'ip6') {
+    if (!isIPv6(v)) {
+      toast.error('请输入合法的 IPv6 地址，如 2001:db8::1')
+      return null
+    }
+    return v
+  }
+  if (t === 'ip_range') {
+    const parts = v.split('/')
+    if (parts.length !== 2) {
+      toast.error('IP 段需为 CIDR 格式，如 1.2.3.0/24')
+      return null
+    }
+    const [addr, prefix] = parts
+    // Cloudflare 官方限制：IPv4 仅 /16、/24；IPv6 仅 /32、/48、/64
+    if (isIPv4(addr)) {
+      if (!['16', '24'].includes(prefix)) {
+        toast.error('IPv4 网段仅支持 /16、/24 前缀（Cloudflare 限制）')
+        return null
+      }
+      return v
+    }
+    if (isIPv6(addr)) {
+      if (!['32', '48', '64'].includes(prefix)) {
+        toast.error('IPv6 网段仅支持 /32、/48、/64 前缀（Cloudflare 限制）')
+        return null
+      }
+      return v
+    }
+    toast.error('IP 段需为合法的 IPv4/IPv6 CIDR，如 1.2.3.0/24')
+    return null
+  }
+  if (t === 'asn') {
+    if (!/^(AS)?\d+$/i.test(v)) {
+      toast.error('ASN 格式不正确，如 AS13335')
+      return null
+    }
+    // 归一化为官方格式：大写 AS 前缀
+    return `AS${v.replace(/^as/i, '')}`
+  }
+  // country：两位字母国家代码，统一大写提交
+  if (!/^[A-Za-z]{2}$/.test(v)) {
+    toast.error('国家代码为两位字母，如 CN')
+    return null
+  }
+  return v.toUpperCase()
+}
+
+async function submitAdd() {
+  const v = normalizeRuleValue()
+  if (v == null) return
   if (!props.zoneId) return
   creating.value = true
   try {
@@ -242,14 +339,17 @@ async function confirmDelete() {
 
 const pageRules = ref<PageRule[]>([])
 const pageRulesLoading = ref(false)
+const pageRulesError = ref('')
 
 async function loadPageRules() {
   if (!props.zoneId) return
   pageRulesLoading.value = true
+  pageRulesError.value = ''
+  pageRules.value = []
   try {
     pageRules.value = await securityApi.listPageRules(props.zoneId)
   } catch (e) {
-    toast.error('加载 Page Rules 失败', { description: e instanceof Error ? e.message : String(e) })
+    pageRulesError.value = e instanceof Error ? e.message : String(e)
   } finally {
     pageRulesLoading.value = false
   }
@@ -354,9 +454,22 @@ function buildPageAction(): PageRuleAction | null {
       toast.error('请输入转发目标 URL')
       return null
     }
+    // 用 URL 构造器校验合法性，且仅允许 http/https 协议
+    try {
+      const u = new URL(target)
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('protocol')
+    } catch {
+      toast.error('转发目标需为合法的 http/https URL')
+      return null
+    }
     return { id: def.id, value: { url: target, status_code: Number(pageForm.value.fwdStatus) } }
   }
   if (def.input === 'number') {
+    // 先拦截空输入，避免 Number('') === 0 被当作合法 TTL 提交
+    if (pageForm.value.value.trim() === '') {
+      toast.error('请输入 TTL（秒）')
+      return null
+    }
     const n = Number(pageForm.value.value)
     // browser_cache_ttl 允许 0（CF 语义：尊重源站响应头）；edge_cache_ttl 必须为正
     const min = def.id === 'browser_cache_ttl' ? 0 : 1
@@ -431,14 +544,11 @@ async function reload() {
   await Promise.all([loadCerts(), loadWafRules(), loadCacheRules(), loadAccessRules(), loadPageRules()])
 }
 
+// 父级已用 :key="zoneId" 在切换 zone 时重建实例，此 watch 仅作兜底
 watch(
   () => props.zoneId,
   () => {
-    loadCerts()
-    loadWafRules()
-    loadCacheRules()
-    loadAccessRules()
-    loadPageRules()
+    reload()
   },
 )
 
@@ -480,6 +590,18 @@ onMounted(() => {
           </div>
         </div>
 
+        <!-- 加载失败 -->
+        <div v-else-if="certsError" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
+          <div class="flex size-12 items-center justify-center rounded-full bg-destructive/10">
+            <ShieldAlert class="size-6 text-destructive" />
+          </div>
+          <div class="text-sm text-destructive">加载证书列表失败：{{ certsError }}</div>
+          <Button size="sm" variant="outline" :disabled="certsLoading" @click="loadCerts">
+            <RefreshCw class="size-4" />
+            重试
+          </Button>
+        </div>
+
         <!-- 空状态 -->
         <div v-else-if="!certRows.length" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
           <div class="flex size-12 items-center justify-center rounded-full bg-muted">
@@ -516,12 +638,24 @@ onMounted(() => {
 
     <!-- WAF 自定义规则 -->
     <Card>
-      <CardHeader>
-        <CardTitle class="flex items-center gap-2 text-base">
-          <ShieldAlert class="size-4 text-primary" />
-          WAF 自定义规则
-        </CardTitle>
-        <CardDescription>该域名的 WAF 自定义规则（http_request_firewall_custom，只读）</CardDescription>
+      <CardHeader class="flex-row items-center justify-between space-y-0">
+        <div>
+          <CardTitle class="flex items-center gap-2 text-base">
+            <ShieldAlert class="size-4 text-primary" />
+            WAF 自定义规则
+          </CardTitle>
+          <CardDescription>按表达式匹配请求并阻止、质询或放行，此处仅展示，编辑请前往 Cloudflare 仪表板</CardDescription>
+        </div>
+        <Button
+          size="sm"
+          variant="outline"
+          as="a"
+          href="https://dash.cloudflare.com/?to=/:account/:zone/security/waf/custom-rules"
+          target="_blank"
+        >
+          <ExternalLink class="size-4" />
+          去 Cloudflare 仪表板修改
+        </Button>
       </CardHeader>
       <CardContent class="p-0">
         <div v-if="wafRulesLoading" class="divide-y">
@@ -530,6 +664,16 @@ onMounted(() => {
             <Skeleton class="h-5 w-24" />
             <Skeleton class="h-5 w-32" />
           </div>
+        </div>
+        <div v-else-if="wafRulesError" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
+          <div class="flex size-12 items-center justify-center rounded-full bg-destructive/10">
+            <ShieldAlert class="size-6 text-destructive" />
+          </div>
+          <div class="text-sm text-destructive">加载 WAF 自定义规则失败：{{ wafRulesError }}</div>
+          <Button size="sm" variant="outline" :disabled="wafRulesLoading" @click="loadWafRules">
+            <RefreshCw class="size-4" />
+            重试
+          </Button>
         </div>
         <div v-else-if="!wafRules.length" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
           <div class="flex size-12 items-center justify-center rounded-full bg-muted">
@@ -567,12 +711,24 @@ onMounted(() => {
 
     <!-- 缓存规则 -->
     <Card>
-      <CardHeader>
-        <CardTitle class="flex items-center gap-2 text-base">
-          <Layers class="size-4 text-primary" />
-          缓存规则
-        </CardTitle>
-        <CardDescription>该域名的缓存规则（http_request_cache_settings，只读）</CardDescription>
+      <CardHeader class="flex-row items-center justify-between space-y-0">
+        <div>
+          <CardTitle class="flex items-center gap-2 text-base">
+            <Layers class="size-4 text-primary" />
+            缓存规则
+          </CardTitle>
+          <CardDescription>按表达式定制缓存行为（TTL、绕过等），此处仅展示，编辑请前往 Cloudflare 仪表板</CardDescription>
+        </div>
+        <Button
+          size="sm"
+          variant="outline"
+          as="a"
+          href="https://dash.cloudflare.com/?to=/:account/:zone/caching/cache-rules"
+          target="_blank"
+        >
+          <ExternalLink class="size-4" />
+          去 Cloudflare 仪表板修改
+        </Button>
       </CardHeader>
       <CardContent class="p-0">
         <div v-if="cacheRulesLoading" class="divide-y">
@@ -581,6 +737,16 @@ onMounted(() => {
             <Skeleton class="h-5 w-24" />
             <Skeleton class="h-5 w-32" />
           </div>
+        </div>
+        <div v-else-if="cacheRulesError" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
+          <div class="flex size-12 items-center justify-center rounded-full bg-destructive/10">
+            <Layers class="size-6 text-destructive" />
+          </div>
+          <div class="text-sm text-destructive">加载缓存规则失败：{{ cacheRulesError }}</div>
+          <Button size="sm" variant="outline" :disabled="cacheRulesLoading" @click="loadCacheRules">
+            <RefreshCw class="size-4" />
+            重试
+          </Button>
         </div>
         <div v-else-if="!cacheRules.length" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
           <div class="flex size-12 items-center justify-center rounded-full bg-muted">
@@ -639,6 +805,16 @@ onMounted(() => {
             <Skeleton class="h-5 w-40" />
             <Skeleton class="h-5 w-8" />
           </div>
+        </div>
+        <div v-else-if="rulesError" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
+          <div class="flex size-12 items-center justify-center rounded-full bg-destructive/10">
+            <ShieldAlert class="size-6 text-destructive" />
+          </div>
+          <div class="text-sm text-destructive">加载访问规则失败：{{ rulesError }}</div>
+          <Button size="sm" variant="outline" :disabled="rulesLoading" @click="loadAccessRules">
+            <RefreshCw class="size-4" />
+            重试
+          </Button>
         </div>
         <div v-else-if="!accessRules.length" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
           <div class="flex size-12 items-center justify-center rounded-full bg-muted">
@@ -707,6 +883,16 @@ onMounted(() => {
             <Skeleton class="h-5 w-48" />
             <Skeleton class="h-5 w-16" />
           </div>
+        </div>
+        <div v-else-if="pageRulesError" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
+          <div class="flex size-12 items-center justify-center rounded-full bg-destructive/10">
+            <Flame class="size-6 text-destructive" />
+          </div>
+          <div class="text-sm text-destructive">加载 Page Rules 失败：{{ pageRulesError }}</div>
+          <Button size="sm" variant="outline" :disabled="pageRulesLoading" @click="loadPageRules">
+            <RefreshCw class="size-4" />
+            重试
+          </Button>
         </div>
         <div v-else-if="!pageRules.length" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
           <div class="flex size-12 items-center justify-center rounded-full bg-muted">
@@ -778,6 +964,7 @@ onMounted(() => {
                 <SelectContent>
                   <SelectItem value="block">阻止</SelectItem>
                   <SelectItem value="challenge">质询</SelectItem>
+                  <SelectItem value="managed_challenge">托管质询</SelectItem>
                   <SelectItem value="js_challenge">JS 质询</SelectItem>
                   <SelectItem value="whitelist">允许</SelectItem>
                 </SelectContent>
@@ -789,6 +976,7 @@ onMounted(() => {
                 <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="ip">{{ TARGET_LABEL.ip }}</SelectItem>
+                  <SelectItem value="ip6">{{ TARGET_LABEL.ip6 }}</SelectItem>
                   <SelectItem value="ip_range">{{ TARGET_LABEL.ip_range }}</SelectItem>
                   <SelectItem value="country">{{ TARGET_LABEL.country }}</SelectItem>
                   <SelectItem value="asn">{{ TARGET_LABEL.asn }}</SelectItem>
@@ -798,7 +986,10 @@ onMounted(() => {
           </div>
           <div class="space-y-2">
             <Label>值</Label>
-            <Input v-model="form.value" :placeholder="form.target === 'country' ? '如 CN' : form.target === 'asn' ? '如 13335' : '如 1.2.3.4 或 1.2.3.0/24'" />
+            <Input v-model="form.value" :placeholder="TARGET_PLACEHOLDER[form.target]" />
+            <p v-if="form.target === 'country'" class="text-xs text-muted-foreground">
+              国家代码 + 阻止 仅 Enterprise 套餐支持，其他套餐请改用质询类动作
+            </p>
           </div>
           <div class="space-y-2">
             <Label>备注（可选）</Label>
@@ -806,7 +997,7 @@ onMounted(() => {
           </div>
         </div>
         <DialogFooter>
-          <Button variant="outline" @click="addOpen = false">取消</Button>
+          <Button variant="outline" :disabled="creating" @click="addOpen = false">取消</Button>
           <Button :disabled="creating" @click="submitAdd">
             <Loader2 v-if="creating" class="size-4 animate-spin" />
             创建
@@ -844,10 +1035,13 @@ onMounted(() => {
           <DialogDescription>匹配 URL 模式并应用缓存动作</DialogDescription>
         </DialogHeader>
         <div class="space-y-4">
+          <p v-if="pageRules.length >= 3" class="rounded-md bg-amber-500/10 px-3 py-2 text-xs text-amber-600">
+            免费套餐上限 3 条（禁用的规则也计数），继续创建可能失败
+          </p>
           <div class="space-y-2">
             <Label>URL 匹配模式</Label>
             <Input v-model="pageForm.url" placeholder="如 example.com/*" />
-            <p class="text-xs text-muted-foreground">支持 * 通配符</p>
+            <p class="text-xs text-muted-foreground">支持 * 通配符（最多 4 个）；省略协议可同时匹配 http/https</p>
           </div>
           <div class="grid grid-cols-2 gap-3">
             <div class="space-y-2">
@@ -872,7 +1066,8 @@ onMounted(() => {
             <!-- TTL 型动作：整数秒 -->
             <div v-else-if="currentActionDef.input === 'number'" class="space-y-2">
               <Label>TTL（秒）</Label>
-              <Input v-model="pageForm.value" type="number" min="1" step="1" placeholder="如 14400" />
+              <!-- browser_cache_ttl 允许 0（尊重源站响应头），edge_cache_ttl 最小为 1 -->
+              <Input v-model="pageForm.value" type="number" :min="currentActionDef.id === 'browser_cache_ttl' ? 0 : 1" step="1" placeholder="如 14400" />
             </div>
             <!-- forwarding_url：值列放重定向状态码，URL 在下方整行输入 -->
             <div v-else-if="currentActionDef.input === 'forwarding'" class="space-y-2">
@@ -914,7 +1109,7 @@ onMounted(() => {
           </div>
         </div>
         <DialogFooter>
-          <Button variant="outline" @click="addPageOpen = false">取消</Button>
+          <Button variant="outline" :disabled="creatingPage" @click="addPageOpen = false">取消</Button>
           <Button :disabled="creatingPage" @click="submitAddPage">
             <Loader2 v-if="creatingPage" class="size-4 animate-spin" />
             创建
