@@ -73,7 +73,7 @@ const zonesLoading = ref(false)
 async function loadZones() {
   zonesLoading.value = true
   try {
-    zones.value = await zonesApi.list({ per_page: 50 })
+    zones.value = await zonesApi.listAll()
   } catch (e) {
     toast.error('加载域名列表失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
@@ -131,7 +131,7 @@ const originDomainPlaceholder = computed(() =>
 )
 const originDomainHint = computed(() =>
   form.originMode === 'domain'
-    ? '源站已有公网域名（非 CF 代理，如对象存储/CDN/自建服务器域名），直接作为回源目标'
+    ? '源站已有公网域名（非 CF 代理，如对象存储/CDN/自建服务器域名），将在 zone 内自动创建回源 CNAME 子域指向它作为 fallback origin'
     : '账号下某 zone 的子域名，需可创建 A 记录，作为 fallback origin',
 )
 
@@ -149,7 +149,8 @@ const manualCnameHint = ref<{ accessDomain: string; preferredDomain: string } | 
 
 function resetSteps() {
   steps.value = [
-    { label: '建回源 A 记录', status: 'pending' },
+    { label: '预检既有配置', status: 'pending' },
+    { label: '配置回源记录', status: 'pending' },
     { label: '配置回退源', status: 'pending' },
     { label: '接入访问域名', status: 'pending' },
     { label: '配置访问域名 CNAME', status: 'pending' },
@@ -158,19 +159,21 @@ function resetSteps() {
   progress.value = 0
 }
 
-/** 部署步骤索引映射：dns=0, fallback=1, hostname=2, cname=3, done=4 */
+/** 部署步骤索引映射：precheck=0, dns=1, fallback=2, hostname=3, cname=4, done=5 */
 function stepIndex(step: SaasDeployProgress['step']): number {
   switch (step) {
-    case 'dns':
+    case 'precheck':
       return 0
-    case 'fallback':
+    case 'dns':
       return 1
-    case 'hostname':
+    case 'fallback':
       return 2
-    case 'cname':
+    case 'hostname':
       return 3
-    default:
+    case 'cname':
       return 4
+    default:
+      return 5
   }
 }
 
@@ -185,8 +188,14 @@ function applyProgress(p: SaasDeployProgress) {
   } else {
     steps.value[idx].status = 'error'
   }
-  progress.value = Math.min(100, Math.round(((idx + (p.step === 'done' ? 1 : 0.5)) / 5) * 100))
-  if (p.step === 'dns') toast.info(p.message || '正在为回源域名配置 A 记录…')
+  progress.value = Math.min(100, Math.round(((idx + (p.step === 'done' ? 1 : 0.5)) / 6) * 100))
+  // 步骤失败用 warning 暴露原因，避免「步骤打叉但 toast 报成功」
+  if (!p.ok) {
+    toast.warning(p.message || '部署步骤出现问题')
+    return
+  }
+  if (p.step === 'precheck') toast.info(p.message || '正在预检既有配置…')
+  else if (p.step === 'dns') toast.info(p.message || '正在配置回源记录…')
   else if (p.step === 'fallback') toast.info(p.message || '正在配置回退源…')
   else if (p.step === 'hostname') toast.info(p.message || '正在接入访问域名…')
   else if (p.step === 'cname') toast.info(p.message || '正在配置访问域名 CNAME…')
@@ -200,6 +209,12 @@ async function onDeploy() {
   }
   if (!accessDomain.value) {
     toast.error('访问域名不完整')
+    return
+  }
+  // 前缀仅允许单级（字母/数字/连字符），防止误填完整域名拼出 www.example.com.example.com
+  const prefix = form.prefix.trim()
+  if (prefix && prefix !== '@' && !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i.test(prefix)) {
+    toast.error('访问域名前缀格式不正确', { description: '仅支持单级前缀（字母/数字/连字符），不要填完整域名' })
     return
   }
   if (!form.originDomain.trim()) {
@@ -238,6 +253,8 @@ async function onDeploy() {
     originDomain: form.originDomain.trim(),
     originIp: form.originMode === 'ip' ? form.originIp.trim() : undefined,
     preferredDomain: preferredDomainValue.value,
+    // 用户已在表单选定 zone，直传避免按域名反查选错（父子 zone 并存场景）
+    zoneId: form.zoneId,
   }
 
   deploying.value = true
@@ -260,6 +277,8 @@ async function onDeploy() {
         description: `CNAME 已自动配置（${config.accessDomain} → ${config.preferredDomain}）`,
       })
     }
+    // 刷新已部署列表，让新部署立即可见
+    void loadDeployments()
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     // 标记当前进行中的步骤为错误
@@ -484,7 +503,7 @@ function statusClass(status: string): string {
                 v-model="form.customPreferred"
                 placeholder="自定义优选域名（如 cdn.example.com）"
               />
-              <p class="text-xs text-muted-foreground">访问域名 CNAME 指向此优选域名，开启小黄云代理</p>
+              <p class="text-xs text-muted-foreground">访问域名 CNAME 指向此优选域名，保持 DNS only（灰云）</p>
             </div>
 
             <!-- 部署按钮 -->
@@ -545,7 +564,7 @@ function statusClass(status: string): string {
                 <code class="rounded bg-muted px-1.5 py-0.5">{{ manualCnameHint.accessDomain }}</code>
                 CNAME 指向
                 <code class="rounded bg-muted px-1.5 py-0.5">{{ manualCnameHint.preferredDomain }}</code>
-                （开启小黄云代理）。
+                （保持 DNS only（灰云），在第三方 DNS 服务商直接添加普通 CNAME 记录即可）。
               </AlertDescription>
             </Alert>
           </CardContent>
@@ -619,7 +638,8 @@ function statusClass(status: string): string {
           <DialogDescription>
             将删除访问域名
             <code class="rounded bg-muted px-1.5 py-0.5 text-xs">{{ deleteTarget?.hostname }}</code>
-            的 custom hostname 及回源 A 记录。此操作不可撤销，源站不受影响。
+            的 custom hostname 及其 CNAME；若该 zone 下已无其他接入，将一并清理回退源与回源 DNS 记录。
+            此操作不可撤销，源站不受影响。
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
