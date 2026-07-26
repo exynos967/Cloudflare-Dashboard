@@ -66,22 +66,13 @@ export const usePresetsStore = defineStore('presets', () => {
     return preset
   }
 
-  /** 拷贝某预设为新用户预设（用于「另存为」） */
-  function duplicatePreset(src: OptimizationPreset, newName?: string): OptimizationPreset {
-    return createPreset(
-      newName ?? `${src.name} 副本`,
-      // 同 createPreset：src 可能来自响应式 Proxy，structuredClone 会抛 DataCloneError，改用 JSON 深拷贝
-      JSON.parse(JSON.stringify(src.settings)) as OptimizationPreset['settings'],
-      src.description,
-    )
-  }
-
-  /** 更新用户预设（改名 / 改值 / 改描述） */
-  function updatePreset(id: string, patch: Partial<Omit<OptimizationPreset, 'id' | 'builtin'>>) {
+  /** 更新用户预设（改名 / 改值 / 改描述）。返回是否找到并更新（false = 预设已不存在） */
+  function updatePreset(id: string, patch: Partial<Omit<OptimizationPreset, 'id' | 'builtin'>>): boolean {
     const idx = userPresets.value.findIndex((p) => p.id === id)
-    if (idx === -1) return
+    if (idx === -1) return false
     const target = userPresets.value[idx]
     userPresets.value[idx] = { ...target, ...patch }
+    return true
   }
 
   /** 删除用户预设（内置不可删） */
@@ -89,10 +80,5 @@ export const usePresetsStore = defineStore('presets', () => {
     userPresets.value = userPresets.value.filter((p) => p.id !== id)
   }
 
-  /** 按 id 查预设（内置或用户） */
-  function getPreset(id: string): OptimizationPreset | undefined {
-    return allPresets.value.find((p) => p.id === id)
-  }
-
-  return { allPresets, userPresets, createPreset, duplicatePreset, updatePreset, deletePreset, getPreset }
+  return { allPresets, userPresets, createPreset, updatePreset, deletePreset }
 })
