@@ -21,6 +21,8 @@ const route = useRoute()
 const routerInst = useRouter()
 const auth = useAuthStore()
 const mode = useTheme()
+// 系统解析后的实际主题（light/dark）：mode 可能是 'auto'，切换按钮须按实际值判断
+const themeState = mode.state
 
 /** 从路由表生成侧边栏菜单（按 group 分组，过滤带参路由） */
 const groups = computed(() => {
@@ -47,14 +49,16 @@ function isActive(p: string) {
   return route.path === p
 }
 function toggleTheme() {
-  mode.value = mode.value === 'dark' ? 'light' : 'dark'
+  mode.value = themeState.value === 'dark' ? 'light' : 'dark'
 }
 function goSettings() {
   routerInst.push('/settings')
 }
-function logout() {
+async function logout() {
+  // 先离开数据视图再清账号：若先 logout，RouterView :key 立即变 'anon' 重挂载当前视图，
+  // 新实例 onMounted 发请求会撞上「未登录」抛错闪 toast
+  await routerInst.push('/login')
   auth.logout()
-  routerInst.push('/login')
 }
 </script>
 
@@ -107,7 +111,7 @@ function logout() {
         <SidebarTrigger />
         <div class="ml-auto flex items-center gap-2">
           <Button variant="ghost" size="icon" @click="toggleTheme">
-            <Sun v-if="mode === 'dark'" class="size-4" />
+            <Sun v-if="themeState === 'dark'" class="size-4" />
             <Moon v-else class="size-4" />
           </Button>
 
@@ -150,7 +154,8 @@ function logout() {
       </header>
 
       <main class="flex-1 p-4 md:p-6">
-        <RouterView />
+        <!-- 按当前账号 key 强制重挂载视图：切换账号后全站数据整体刷新 -->
+        <RouterView :key="auth.currentAccountId ?? 'anon'" />
       </main>
     </SidebarInset>
   </SidebarProvider>
