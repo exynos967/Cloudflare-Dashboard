@@ -61,8 +61,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   zonesApi,
+  CFError,
   applyOptimizationPreset,
   applySingleSetting,
   listZoneSettings,
@@ -86,16 +88,24 @@ const zoneId = computed(() => String(route.params.zoneId))
 
 const zone = ref<Zone | null>(null)
 const loading = ref(true)
+const loadError = ref<string | null>(null)
 const activeTab = ref('dns')
 
 async function load() {
+  const id = zoneId.value // 进入时捕获 id，await 后校验，防止切 zone 后旧响应写入新状态
   loading.value = true
+  loadError.value = null
   try {
-    zone.value = await zonesApi.get(zoneId.value)
+    const z = await zonesApi.get(id)
+    if (id !== zoneId.value) return // 已切换 zone，丢弃旧响应
+    zone.value = z
   } catch (e) {
-    toast.error('加载域名信息失败', { description: e instanceof Error ? e.message : String(e) })
+    if (id !== zoneId.value) return
+    loadError.value = e instanceof Error ? e.message : String(e)
+    toast.error('加载域名信息失败', { description: loadError.value })
   } finally {
-    loading.value = false
+    // 已切换 zone 时由新一轮 load 管理 loading，不回写
+    if (id === zoneId.value) loading.value = false
   }
 }
 
@@ -104,7 +114,9 @@ onMounted(load)
 // 路由参数 zoneId 变化时组件被复用：重置本地状态并重新加载，避免显示 A 的数据、写入 B 的 zone
 watch(zoneId, () => {
   zone.value = null
+  loadError.value = null
   zoneSettings.value = {}
+  settingsError.value = null
   load()
   if (activeTab.value === 'preset') loadZoneSettings()
 })
@@ -118,9 +130,15 @@ watch(activeTab, (t) => {
 
 const purging = ref(false)
 const devModeLoading = ref(false)
+/** 清除缓存二次确认（项目统一 Dialog，不用原生 confirm） */
+const purgeConfirmOpen = ref(false)
 
-async function purgeAll() {
-  if (!confirm('确认清除该域名下的全部缓存？')) return
+function purgeAll() {
+  purgeConfirmOpen.value = true
+}
+
+async function confirmPurgeAll() {
+  purgeConfirmOpen.value = false
   purging.value = true
   try {
     await zonesApi.purgeCache(zoneId.value)
@@ -133,9 +151,11 @@ async function purgeAll() {
 }
 
 async function toggleDevMode(on: boolean) {
+  const id = zoneId.value // 竞态守卫：切 zone 后旧响应不写入新 zone
   devModeLoading.value = true
   try {
-    await zonesApi.setDevelopmentMode(zoneId.value, on)
+    await zonesApi.setDevelopmentMode(id, on)
+    if (id !== zoneId.value) return
     if (zone.value) zone.value.development_mode = on ? 1 : 0
     toast.success(on ? '开发模式已开启（跳过缓存）' : '开发模式已关闭')
   } catch (e) {
@@ -150,26 +170,38 @@ async function toggleDevMode(on: boolean) {
 const presetsStore = usePresetsStore()
 
 const applyingPresetId = ref<string | null>(null)
+/** 应用预设进行中：期间锁定单项调节与另存为/编辑/删除，避免并发写冲突 */
+const presetApplying = computed(() => applyingPresetId.value !== null)
 
 /** 单项调节：当前 zone 各 setting 实际值 */
 const zoneSettings = ref<Record<string, ZoneSettingItem>>({})
 const settingsLoading = ref(false)
+const settingsError = ref<string | null>(null)
 /** 正在写入中的 setting id 集合：并发调节多个设置时各自独立 disabled，互不干扰 */
 const singleApplying = ref<Set<string>>(new Set())
 
 async function loadZoneSettings() {
-  if (!zoneId.value) return
+  const id = zoneId.value // 进入时捕获 id，await 后校验，防止切 zone 后旧响应写入新状态
+  if (!id) return
   settingsLoading.value = true
+  settingsError.value = null
   try {
-    const list = await listZoneSettings(zoneId.value)
+    const list = await listZoneSettings(id)
+    if (id !== zoneId.value) return // 已切换 zone，丢弃旧响应
     const map: Record<string, ZoneSettingItem> = {}
     for (const s of list) map[s.id] = s
     zoneSettings.value = map
-  } catch {
-    // 旧套餐可能不支持该列表端点，降级为空（单项调节仍可写，但读不到当前值）
-    zoneSettings.value = {}
+  } catch (e) {
+    if (id !== zoneId.value) return
+    if (e instanceof CFError && (e.status === 403 || e.status === 404)) {
+      // 旧套餐可能不支持该列表端点，降级为空（单项调节仍可写，但读不到当前值）
+      zoneSettings.value = {}
+    } else {
+      settingsError.value = e instanceof Error ? e.message : String(e)
+      toast.error('加载当前配置失败', { description: settingsError.value })
+    }
   } finally {
-    settingsLoading.value = false
+    if (id === zoneId.value) settingsLoading.value = false
   }
 }
 
@@ -204,25 +236,44 @@ const selectedPresetId = ref<string>(CURRENT_PRESET_ID)
 const selectedPreset = computed(() => allPresets.value.find((p) => p.id === selectedPresetId.value))
 const isSelectedCurrent = computed(() => selectedPresetId.value === CURRENT_PRESET_ID)
 
-async function applyPreset(preset: OptimizationPreset) {
-  const count = Object.keys(preset.settings).length
-  if (!confirm(`确认应用「${preset.name}」？\n\n将批量覆盖该域名 ${count} 项配置，此操作不可撤销。`))
+/** 待应用的预设（项目内 Dialog 二次确认，不用原生 confirm） */
+const presetApplyTarget = ref<OptimizationPreset | null>(null)
+
+function applyPreset(preset: OptimizationPreset) {
+  if (Object.keys(preset.settings).length === 0) {
+    toast.error('该预设没有任何配置项')
     return
+  }
+  presetApplyTarget.value = preset
+}
+
+async function confirmApplyPreset() {
+  const preset = presetApplyTarget.value
+  if (!preset) return
+  presetApplyTarget.value = null
+  const id = zoneId.value // 竞态守卫：切 zone 后旧结果不再提示/刷新
   applyingPresetId.value = preset.id
   try {
-    const results = await applyOptimizationPreset(zoneId.value, preset)
-    const okCount = results.filter((r) => r.ok).length
-    const failCount = results.length - okCount
-    if (failCount === 0) {
+    const results = await applyOptimizationPreset(id, preset)
+    if (id !== zoneId.value) return
+    const failed = results.filter((r) => !r.ok)
+    const okCount = results.length - failed.length
+    if (failed.length === 0) {
       toast.success(`「${preset.name}」已应用`, { description: `全部 ${okCount} 项配置成功` })
     } else {
-      toast.warning(`「${preset.name}」部分应用`, {
-        description: `成功 ${okCount} 项，失败 ${failCount} 项（失败项多为当前套餐不支持该功能）`,
+      // 失败明细：中文标签 + 原因，最多列 5 条
+      const lines = failed
+        .slice(0, 5)
+        .map((r) => `${getSettingDef(r.id)?.label ?? r.id}：${r.error ?? '未知原因'}`)
+      if (failed.length > 5) lines.push('…')
+      toast.error(`「${preset.name}」部分应用失败`, {
+        description: `成功 ${okCount} 项，失败 ${failed.length} 项\n${lines.join('\n')}`,
       })
     }
     // 应用后刷新当前值
     await loadZoneSettings()
   } catch (e) {
+    if (id !== zoneId.value) return
     toast.error('应用失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
     applyingPresetId.value = null
@@ -231,9 +282,13 @@ async function applyPreset(preset: OptimizationPreset) {
 
 /** 单项调节：实时写一项 */
 async function applySingle(defId: string, value: SettingValue) {
+  // 重复选中同值不重复 PATCH
+  if (value === currentValue(defId)) return
+  const zid = zoneId.value // 竞态守卫：切 zone 后旧响应不写入新 zone 的 settings
   singleApplying.value.add(defId)
   try {
-    await applySingleSetting(zoneId.value, defId, value)
+    await applySingleSetting(zid, defId, value)
+    if (zid !== zoneId.value) return
     // 本地乐观更新
     zoneSettings.value = {
       ...zoneSettings.value,
@@ -302,18 +357,21 @@ function saveDraft() {
     toast.error('请填写预设名称')
     return
   }
-  if (editingPreset.value?.builtin) {
-    // 内置预设只读：保存时另存为用户预设副本
-    const created = presetsStore.createPreset(name, editorDraft.value.settings, editorDraft.value.description)
-    selectedPresetId.value = created.id
-    toast.success('内置预设不可修改，已另存为用户预设')
-  } else if (editingPreset.value) {
-    // 编辑已有用户预设
-    presetsStore.updatePreset(editingPreset.value.id, {
+  if (Object.keys(editorDraft.value.settings).length === 0) {
+    toast.error('请至少勾选 1 项配置')
+    return
+  }
+  if (editingPreset.value) {
+    // 编辑已有用户预设（预设可能已在别处被删除，更新失败则中止不假报成功）
+    const ok = presetsStore.updatePreset(editingPreset.value.id, {
       name,
       description: editorDraft.value.description,
       settings: editorDraft.value.settings,
     })
+    if (!ok) {
+      toast.error('预设已不存在')
+      return
+    }
     toast.success('预设已更新')
   } else {
     // 新建
@@ -338,7 +396,11 @@ function saveCurrentAsPreset() {
     return
   }
   const settings = Object.fromEntries(entries) as Record<string, SettingValue>
-  const name = `${zone.value?.name ?? '当前'} 的配置`
+  // 同名时追加序号，避免多份预设名称完全相同难以区分
+  const base = `${zone.value?.name ?? '当前'} 的配置`
+  const existing = new Set(presetsStore.allPresets.map((p) => p.name))
+  let name = base
+  for (let i = 2; existing.has(name); i++) name = `${base} ${i}`
   const created = presetsStore.createPreset(name, settings)
   selectedPresetId.value = created.id
   toast.success(`已将当前配置另存为「${name}」`, {
@@ -388,6 +450,22 @@ function displayValue(def: SettingDef, value: SettingValue | undefined): string 
     return optionLabel(def.id, String(value))
   }
   return String(value)
+}
+
+/** select 选项列表：实际值不在枚举内时动态追加（避免 Select 空占位），模板据 def.options 判断标注（当前） */
+function selectOptions(def: SettingDef, value: SettingValue | undefined): string[] {
+  const opts = def.options ?? []
+  if (value === undefined || value === null || value === '') return opts
+  const s = String(value)
+  return opts.includes(s) ? opts : [...opts, s]
+}
+
+/** number 选项列表：同 selectOptions，处理枚举秒数外的实际值 */
+function numberSelectOptions(def: SettingDef, value: SettingValue | undefined): number[] {
+  const opts = def.numberOptions ?? []
+  if (value === undefined || value === null || value === '') return opts
+  const n = Number(value)
+  return opts.includes(n) ? opts : [...opts, n]
 }
 
 function defaultForSetting(defId: string): SettingValue {
@@ -493,7 +571,7 @@ function fmtDate(s: string | null): string {
             </div>
             <div>
               <div class="flex items-center gap-2">
-                <CardTitle class="text-lg">{{ zone?.name ?? '加载中…' }}</CardTitle>
+                <CardTitle class="text-lg">{{ zone?.name ?? (loadError ? zoneId : '加载中…') }}</CardTitle>
                 <Badge
                   v-if="zone"
                   :class="isActive ? 'bg-emerald-500/15 text-emerald-600' : 'bg-muted text-muted-foreground'"
@@ -504,7 +582,7 @@ function fmtDate(s: string | null): string {
               </div>
               <CardDescription>
                 <template v-if="zone">{{ zone.plan?.name ?? '未知套餐' }} · {{ zone.account?.name ?? zone.account?.id }}</template>
-                <template v-else>正在加载域名信息</template>
+                <template v-else>{{ loadError ? '域名信息加载失败' : '正在加载域名信息' }}</template>
               </CardDescription>
             </div>
           </div>
@@ -520,6 +598,20 @@ function fmtDate(s: string | null): string {
           </div>
         </div>
       </CardHeader>
+    </Card>
+
+    <!-- 加载失败错误卡片 -->
+    <Card v-if="loadError && !zone">
+      <CardContent class="flex flex-wrap items-center justify-between gap-4 py-6">
+        <div class="min-w-0">
+          <div class="text-sm font-medium text-destructive">加载域名信息失败</div>
+          <p class="mt-1 break-all text-xs text-muted-foreground">{{ loadError }}</p>
+        </div>
+        <Button variant="outline" size="sm" :disabled="loading" @click="load">
+          <RefreshCw class="size-4" :class="{ 'animate-spin': loading }" />
+          重试
+        </Button>
+      </CardContent>
     </Card>
 
     <!-- Tabs -->
@@ -543,7 +635,8 @@ function fmtDate(s: string | null): string {
             <CardDescription>管理该域名的所有 DNS 记录</CardDescription>
           </CardHeader>
           <CardContent>
-            <DNSRecordManager :zone-id="zoneId" :zone-name="zone?.name" />
+            <!-- key 绑定 zoneId：切 zone 强制重建实例，杜绝旧实例在途响应写入 -->
+            <DNSRecordManager :key="zoneId" :zone-id="zoneId" :zone-name="zone?.name" />
           </CardContent>
         </Card>
       </TabsContent>
@@ -560,7 +653,7 @@ function fmtDate(s: string | null): string {
               <CardDescription>一键清除该域名下的所有缓存资源</CardDescription>
             </CardHeader>
             <CardContent>
-              <Button variant="destructive" :disabled="purging" @click="purgeAll">
+              <Button variant="destructive" :disabled="purging || !zone" @click="purgeAll">
                 <Loader2 v-if="purging" class="size-4 animate-spin" />
                 清除全部缓存
               </Button>
@@ -591,7 +684,7 @@ function fmtDate(s: string | null): string {
                 </div>
                 <Switch
                   :model-value="devModeOn"
-                  :disabled="devModeLoading"
+                  :disabled="devModeLoading || !zone"
                   @update:model-value="(v: boolean) => toggleDevMode(v)"
                 />
               </div>
@@ -638,14 +731,14 @@ function fmtDate(s: string | null): string {
                   <component :is="ShieldCheck" v-else class="size-4" />
                   应用
                 </Button>
-                <Button variant="outline" size="sm" title="将当前配置另存为新预设" @click="saveCurrentAsPreset">
+                <Button variant="outline" size="sm" title="将当前配置另存为新预设" :disabled="presetApplying" @click="saveCurrentAsPreset">
                   <Copy class="size-3.5" />
                   另存为
                 </Button>
-                <Button v-if="selectedPreset && !isSelectedCurrent" variant="outline" size="sm" title="编辑预设" @click="selectedPreset && openEditor(selectedPreset)">
+                <Button v-if="selectedPreset && !isSelectedCurrent" variant="outline" size="sm" title="编辑预设" :disabled="presetApplying" @click="selectedPreset && openEditor(selectedPreset)">
                   <Pencil class="size-3.5" />
                 </Button>
-                <Button v-if="selectedPreset && !selectedPreset.builtin" variant="ghost" size="sm" class="text-destructive hover:text-destructive" title="删除预设" @click="selectedPreset && deletePreset(selectedPreset)">
+                <Button v-if="selectedPreset && !selectedPreset.builtin" variant="ghost" size="sm" class="text-destructive hover:text-destructive" title="删除预设" :disabled="presetApplying" @click="selectedPreset && deletePreset(selectedPreset)">
                   <Trash2 class="size-3.5" />
                 </Button>
                 <Button variant="ghost" size="sm" class="ml-auto" @click="openNewPreset">
@@ -668,63 +761,86 @@ function fmtDate(s: string | null): string {
                 </Button>
               </div>
 
-              <div v-for="g in SETTING_GROUPS" :key="g.key">
-                <div class="mb-2 text-xs font-medium text-muted-foreground">{{ g.label }}</div>
-                <div class="grid gap-2 sm:grid-cols-2">
-                  <div
-                    v-for="def in SETTING_DEFS.filter((d) => d.group === g.key)"
-                    :key="def.id"
-                    class="flex items-center justify-between gap-3 rounded-lg border p-3"
-                  >
-                    <div class="min-w-0">
-                      <div class="flex items-center gap-1.5 text-sm">
-                        {{ def.label }}
-                        <Badge v-if="def.requiresPro" variant="outline" class="text-[10px]">Pro</Badge>
+              <!-- 加载出错：错误信息 + 重试（403/404 已在逻辑层降级，不会走到这里） -->
+              <Alert v-if="settingsError" variant="destructive" class="py-3">
+                <AlertDescription class="flex flex-wrap items-center justify-between gap-3 text-xs">
+                  <span class="break-all">加载当前配置失败：{{ settingsError }}</span>
+                  <Button variant="outline" size="sm" :disabled="settingsLoading" @click="loadZoneSettings">
+                    <RefreshCw class="size-3.5" :class="{ 'animate-spin': settingsLoading }" />
+                    重试
+                  </Button>
+                </AlertDescription>
+              </Alert>
+
+              <!-- 加载中：骨架占位 -->
+              <div v-else-if="settingsLoading" class="grid gap-2 sm:grid-cols-2">
+                <Skeleton v-for="i in 8" :key="i" class="h-16 rounded-lg" />
+              </div>
+
+              <template v-else>
+                <div v-for="g in SETTING_GROUPS" :key="g.key">
+                  <div class="mb-2 text-xs font-medium text-muted-foreground">{{ g.label }}</div>
+                  <div class="grid gap-2 sm:grid-cols-2">
+                    <div
+                      v-for="def in SETTING_DEFS.filter((d) => d.group === g.key)"
+                      :key="def.id"
+                      class="flex items-center justify-between gap-3 rounded-lg border p-3"
+                    >
+                      <div class="min-w-0">
+                        <div class="flex items-center gap-1.5 text-sm">
+                          {{ def.label }}
+                          <Badge v-if="def.requiresPro" variant="outline" class="text-[10px]">Pro</Badge>
+                        </div>
+                        <div class="truncate text-xs text-muted-foreground">
+                          当前：{{ displayValue(def, currentValue(def.id)) }}
+                        </div>
+                        <div v-if="zoneSettings[def.id]?.editable === false" class="text-[10px] text-amber-600">
+                          套餐不支持修改
+                        </div>
                       </div>
-                      <div class="truncate text-xs text-muted-foreground">
-                        当前：{{ displayValue(def, currentValue(def.id)) }}
-                      </div>
+                      <!-- onoff -->
+                      <Switch
+                        v-if="def.type === 'onoff'"
+                        :model-value="currentValue(def.id) === 'on'"
+                        :disabled="singleApplying.has(def.id) || presetApplying || zoneSettings[def.id]?.editable === false"
+                        @update:model-value="(v) => applySingle(def.id, v ? 'on' : 'off')"
+                      />
+                      <!-- select / security_level -->
+                      <Select
+                        v-else-if="def.type === 'select' || def.type === 'security_level'"
+                        :model-value="String(currentValue(def.id) ?? '')"
+                        :disabled="singleApplying.has(def.id) || presetApplying || zoneSettings[def.id]?.editable === false"
+                        @update:model-value="(v) => applySingle(def.id, String(v))"
+                      >
+                        <SelectTrigger class="w-36">
+                          <SelectValue placeholder="选择" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem v-for="o in selectOptions(def, currentValue(def.id))" :key="o" :value="o">
+                            {{ optionLabel(def.id, o) }}{{ def.options?.includes(o) ? '' : '（当前）' }}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <!-- number（枚举秒数） -->
+                      <Select
+                        v-else-if="def.type === 'number'"
+                        :model-value="String(currentValue(def.id) ?? '')"
+                        :disabled="singleApplying.has(def.id) || presetApplying || zoneSettings[def.id]?.editable === false"
+                        @update:model-value="(v) => applySingle(def.id, Number(v))"
+                      >
+                        <SelectTrigger class="w-36">
+                          <SelectValue placeholder="选择" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem v-for="o in numberSelectOptions(def, currentValue(def.id))" :key="o" :value="String(o)">
+                            {{ fmtSeconds(o) }}{{ def.numberOptions?.includes(o) ? '' : '（当前）' }}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
                     </div>
-                    <!-- onoff -->
-                    <Switch
-                      v-if="def.type === 'onoff'"
-                      :model-value="currentValue(def.id) === 'on'"
-                      :disabled="singleApplying.has(def.id)"
-                      @update:model-value="(v) => applySingle(def.id, v ? 'on' : 'off')"
-                    />
-                    <!-- select / security_level -->
-                    <Select
-                      v-else-if="def.type === 'select' || def.type === 'security_level'"
-                      :model-value="String(currentValue(def.id) ?? '')"
-                      :disabled="singleApplying.has(def.id)"
-                      @update:model-value="(v) => applySingle(def.id, String(v))"
-                    >
-                      <SelectTrigger class="w-36">
-                        <SelectValue placeholder="选择" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem v-for="o in def.options" :key="o" :value="o">{{ optionLabel(def.id, o) }}</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <!-- number（枚举秒数） -->
-                    <Select
-                      v-else-if="def.type === 'number'"
-                      :model-value="String(currentValue(def.id) ?? '')"
-                      :disabled="singleApplying.has(def.id)"
-                      @update:model-value="(v) => applySingle(def.id, Number(v))"
-                    >
-                      <SelectTrigger class="w-36">
-                        <SelectValue placeholder="选择" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem v-for="o in def.numberOptions" :key="o" :value="String(o)">
-                          {{ fmtSeconds(o) }}
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
                   </div>
                 </div>
-              </div>
+              </template>
             </CardContent>
           </Card>
         </div>
@@ -732,7 +848,8 @@ function fmtDate(s: string | null): string {
 
       <!-- 安全规则 -->
       <TabsContent value="security" class="mt-4">
-        <ZoneSecurityRules :zone-id="zoneId" />
+        <!-- key 绑定 zoneId：切 zone 强制重建实例，杜绝旧实例在途响应写入 -->
+        <ZoneSecurityRules :key="zoneId" :zone-id="zoneId" />
       </TabsContent>
 
       <!-- 预设编辑器 -->
@@ -783,7 +900,9 @@ function fmtDate(s: string | null): string {
                       >
                         <SelectTrigger class="w-32"><SelectValue /></SelectTrigger>
                         <SelectContent>
-                          <SelectItem v-for="o in def.options" :key="o" :value="o">{{ optionLabel(def.id, o) }}</SelectItem>
+                          <SelectItem v-for="o in selectOptions(def, editorDraft.settings[def.id])" :key="o" :value="o">
+                            {{ optionLabel(def.id, o) }}{{ def.options?.includes(o) ? '' : '（当前）' }}
+                          </SelectItem>
                         </SelectContent>
                       </Select>
                       <Select
@@ -793,8 +912,8 @@ function fmtDate(s: string | null): string {
                       >
                         <SelectTrigger class="w-32"><SelectValue /></SelectTrigger>
                         <SelectContent>
-                          <SelectItem v-for="o in def.numberOptions" :key="o" :value="String(o)">
-                            {{ fmtSeconds(o) }}
+                          <SelectItem v-for="o in numberSelectOptions(def, editorDraft.settings[def.id])" :key="o" :value="String(o)">
+                            {{ fmtSeconds(o) }}{{ def.numberOptions?.includes(o) ? '' : '（当前）' }}
                           </SelectItem>
                         </SelectContent>
                       </Select>
@@ -813,6 +932,12 @@ function fmtDate(s: string | null): string {
 
       <!-- 概览 -->
       <TabsContent value="overview" class="mt-4">
+        <!-- 域名未激活提示 -->
+        <Alert v-if="zone && !isActive" class="mb-4 py-2">
+          <AlertDescription class="text-xs">
+            域名尚未激活（{{ zone.status }}），部分操作可能被 Cloudflare 拒绝
+          </AlertDescription>
+        </Alert>
         <Card v-if="zone">
           <CardHeader>
             <CardTitle class="text-base">域名概览</CardTitle>
@@ -919,6 +1044,49 @@ function fmtDate(s: string | null): string {
           <Button variant="destructive" :disabled="deleting" @click="confirmDelete">
             <Loader2 v-if="deleting" class="size-4 animate-spin" />
             确认删除
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <!-- 清除缓存确认 -->
+    <Dialog v-model:open="purgeConfirmOpen">
+      <DialogContent class="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>清除全部缓存</DialogTitle>
+          <DialogDescription>
+            确认清除域名 <span class="font-medium text-foreground">{{ zone?.name ?? zoneId }}</span> 下的全部缓存？
+            清除后访问者将回源重新拉取最新内容。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" @click="purgeConfirmOpen = false">取消</Button>
+          <Button variant="destructive" :disabled="purging" @click="confirmPurgeAll">
+            <Loader2 v-if="purging" class="size-4 animate-spin" />
+            确认清除
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <!-- 应用预设确认 -->
+    <Dialog
+      :open="!!presetApplyTarget"
+      @update:open="(v) => { if (!v) presetApplyTarget = null }"
+    >
+      <DialogContent class="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>应用预设</DialogTitle>
+          <DialogDescription>
+            确认应用 <span class="font-medium text-foreground">{{ presetApplyTarget?.name }}</span>？
+            将批量覆盖该域名 {{ Object.keys(presetApplyTarget?.settings ?? {}).length }} 项配置，此操作不可撤销。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" @click="presetApplyTarget = null">取消</Button>
+          <Button :disabled="presetApplying" @click="confirmApplyPreset">
+            <Loader2 v-if="presetApplying" class="size-4 animate-spin" />
+            确认应用
           </Button>
         </DialogFooter>
       </DialogContent>
