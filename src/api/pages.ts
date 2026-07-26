@@ -14,9 +14,13 @@ function projectBase(name: string): string {
 }
 
 export const pagesApi = {
-  /** 列出账号下所有 Pages 项目（自动翻页） */
+  /**
+   * 列出账号下所有 Pages 项目（自动翻页）。
+   * 注意：该端点的 per_page 上限远低于通用端点（50 会报 8000024
+   * "Invalid list options"），对齐 wrangler 官方实现取 10。
+   */
   listProjects: () =>
-    listAll<PagesProject>(`/accounts/${accountId()}/pages/projects`),
+    listAll<PagesProject>(`/accounts/${accountId()}/pages/projects`, {}, { perPage: 10 }),
 
   /** 获取单个 Pages 项目详情 */
   getProject: (name: string) => http.get<PagesProject>(projectBase(name)),
@@ -30,9 +34,9 @@ export const pagesApi = {
   /** 删除 Pages 项目 */
   deleteProject: (name: string) => http.delete<void>(projectBase(name)),
 
-  /** 列出项目下的部署记录（自动翻页） */
+  /** 列出项目下的部署记录（自动翻页；per_page 同样保守取 10，见 listProjects 注释） */
   listDeployments: (name: string) =>
-    listAll<PagesDeployment>(`${projectBase(name)}/deployments`),
+    listAll<PagesDeployment>(`${projectBase(name)}/deployments`, {}, { perPage: 10 }),
 
   /** 获取单个部署详情 */
   getDeployment: (name: string, id: string) =>
