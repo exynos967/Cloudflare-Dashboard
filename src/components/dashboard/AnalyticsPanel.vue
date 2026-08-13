@@ -146,6 +146,7 @@ async function loadWorkers() {
   } catch (e) {
     if (seq !== workersSeq) return
     workerError.value = e instanceof Error ? e.message : String(e)
+    toast.error('加载 Workers 数据失败', { description: workerError.value })
   } finally {
     if (seq === workersSeq) workerLoading.value = false
   }
@@ -517,7 +518,7 @@ const workerTrendOption = computed(() => {
           class="ml-auto"
           @click="() => { loadAnalytics(); loadWorkers() }"
         >
-          <RefreshCw class="size-4" :class="{ 'animate-spin': loading }" />
+          <RefreshCw class="size-4" :class="{ 'animate-spin': loading || workerLoading }" />
           刷新
         </Button>
       </div>
