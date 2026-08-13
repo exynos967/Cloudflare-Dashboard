@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { toast } from 'vue-sonner'
-import { RefreshCw, Loader2, ShieldAlert, Globe, Plus, Trash2, Flame, Layers } from '@lucide/vue'
+import { RefreshCw, Loader2, ShieldAlert, Globe, Plus, Trash2, Flame, Layers, Link2 } from '@lucide/vue'
 import { securityApi } from '@/api'
 import type {
   CertificatePack,
@@ -335,6 +335,144 @@ async function confirmDeleteCache() {
     toast.error('删除失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
     deletingCache.value = false
+  }
+}
+
+/* ----------------------------- 重定向规则 ----------------------------- */
+
+const redirectRules = ref<RulesetRule[]>([])
+const redirectLoading = ref(false)
+const redirectError = ref('')
+
+async function loadRedirectRules() {
+  if (!props.zoneId) return
+  redirectLoading.value = true
+  redirectError.value = ''
+  redirectRules.value = []
+  try {
+    const snap = await securityApi.listRedirectRules(props.zoneId)
+    redirectRules.value = snap.rules
+  } catch (e) {
+    redirectError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    redirectLoading.value = false
+  }
+}
+
+function redirectTarget(r: RulesetRule): string {
+  const fv = r.action_parameters?.from_value as
+    | { target_url?: { value?: string; expression?: string }; status_code?: number }
+    | undefined
+  return fv?.target_url?.value || fv?.target_url?.expression || '—'
+}
+
+function redirectStatus(r: RulesetRule): string {
+  const fv = r.action_parameters?.from_value as { status_code?: number } | undefined
+  return fv?.status_code != null ? String(fv.status_code) : '—'
+}
+
+const addRedirectOpen = ref(false)
+const creatingRedirect = ref(false)
+const redirectForm = ref({
+  source: '',
+  target: '',
+  status: '301' as '301' | '302' | '307' | '308',
+  preserveQuery: true,
+  description: '',
+  customExpr: false,
+  expression: '',
+})
+
+function openAddRedirect() {
+  redirectForm.value = {
+    source: '',
+    target: '',
+    status: '301',
+    preserveQuery: true,
+    description: '',
+    customExpr: false,
+    expression: '',
+  }
+  addRedirectOpen.value = true
+}
+
+function escapeCfString(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
+function buildRedirectExpression(): string | null {
+  if (redirectForm.value.customExpr) {
+    const e = redirectForm.value.expression.trim()
+    if (!e) {
+      toast.error('请填写匹配表达式')
+      return null
+    }
+    return e
+  }
+  const src = redirectForm.value.source.trim()
+  if (!src) {
+    toast.error('请填写来源路径或 URL')
+    return null
+  }
+  if (src.startsWith('http://') || src.startsWith('https://')) {
+    if (src.includes('*')) return `(http.request.full_uri wildcard "${escapeCfString(src)}")`
+    return `(http.request.full_uri eq "${escapeCfString(src)}")`
+  }
+  const path = src.startsWith('/') ? src : `/${src}`
+  if (path.endsWith('*')) return `(http.request.uri.path wildcard "${escapeCfString(path)}")`
+  return `(http.request.uri.path eq "${escapeCfString(path)}")`
+}
+
+async function submitAddRedirect() {
+  if (!props.zoneId) return
+  const expression = buildRedirectExpression()
+  if (!expression) return
+  const target = redirectForm.value.target.trim()
+  if (!target) {
+    toast.error('请填写目标 URL')
+    return
+  }
+  try {
+    new URL(target)
+  } catch {
+    toast.error('目标须为完整 URL，如 https://example.com/new')
+    return
+  }
+  creatingRedirect.value = true
+  try {
+    await securityApi.createRedirectRule(props.zoneId, {
+      expression,
+      description: redirectForm.value.description.trim() || undefined,
+      statusCode: Number(redirectForm.value.status) as 301 | 302 | 307 | 308,
+      targetUrl: target,
+      preserveQuery: redirectForm.value.preserveQuery,
+      enabled: true,
+    })
+    toast.success('重定向规则已创建')
+    addRedirectOpen.value = false
+    await loadRedirectRules()
+  } catch (e) {
+    toast.error('创建失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    creatingRedirect.value = false
+  }
+}
+
+const deleteRedirectTarget = ref<RulesetRule | null>(null)
+const deletingRedirect = ref(false)
+
+async function confirmDeleteRedirect() {
+  if (!deleteRedirectTarget.value || !props.zoneId) return
+  deletingRedirect.value = true
+  try {
+    await securityApi.deleteRedirectRule(props.zoneId, deleteRedirectTarget.value.id)
+    toast.success('已删除')
+    deleteRedirectTarget.value = null
+    await loadRedirectRules()
+  } catch (e) {
+    toast.error('删除失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    deletingRedirect.value = false
   }
 }
 
@@ -725,12 +863,20 @@ const refreshing = computed(
     certsLoading.value ||
     wafRulesLoading.value ||
     cacheRulesLoading.value ||
+    redirectLoading.value ||
     rulesLoading.value ||
     pageRulesLoading.value,
 )
 
 async function reload() {
-  await Promise.all([loadCerts(), loadWafRules(), loadCacheRules(), loadAccessRules(), loadPageRules()])
+  await Promise.all([
+    loadCerts(),
+    loadWafRules(),
+    loadCacheRules(),
+    loadRedirectRules(),
+    loadAccessRules(),
+    loadPageRules(),
+  ])
 }
 
 // 父级已用 :key="zoneId" 在切换 zone 时重建实例，此 watch 仅作兜底
@@ -752,7 +898,7 @@ onMounted(() => {
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div>
         <h1 class="text-xl font-semibold tracking-tight">安全规则</h1>
-        <p class="text-sm text-muted-foreground">边缘证书、WAF 自定义规则、缓存规则、IP 访问规则与 Page Rules</p>
+        <p class="text-sm text-muted-foreground">边缘证书、WAF、缓存规则、重定向、IP 访问规则与 Page Rules</p>
       </div>
       <Button variant="ghost" size="sm" :disabled="refreshing" @click="reload">
         <RefreshCw class="size-4" :class="{ 'animate-spin': refreshing }" />
@@ -983,6 +1129,70 @@ onMounted(() => {
       </CardContent>
     </Card>
 
+    <!-- 重定向规则 -->
+    <Card>
+      <CardHeader class="flex-row items-center justify-between space-y-0">
+        <div>
+          <CardTitle class="flex items-center gap-2 text-base">
+            <Link2 class="size-4 text-primary" />
+            重定向规则
+          </CardTitle>
+          <CardDescription>
+            Single Redirects（http_request_dynamic_redirect）。追加走 POST，不会整表覆盖。流量须走小黄云。
+          </CardDescription>
+        </div>
+        <Button size="sm" @click="openAddRedirect">
+          <Plus class="size-4" />
+          添加规则
+        </Button>
+      </CardHeader>
+      <CardContent class="p-0">
+        <div v-if="redirectLoading" class="divide-y">
+          <div v-for="i in 3" :key="i" class="flex items-center gap-3 px-4 py-3">
+            <Skeleton class="h-5 flex-1" />
+            <Skeleton class="h-5 w-24" />
+          </div>
+        </div>
+        <div v-else-if="redirectError" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
+          <div class="text-sm text-destructive">加载重定向规则失败：{{ redirectError }}</div>
+          <Button size="sm" variant="outline" @click="loadRedirectRules">重试</Button>
+        </div>
+        <div v-else-if="!redirectRules.length" class="flex flex-col items-center gap-3 px-4 py-12 text-center">
+          <div class="text-sm text-muted-foreground">暂无重定向规则</div>
+          <Button size="sm" @click="openAddRedirect">
+            <Plus class="size-4" />
+            添加第一条
+          </Button>
+        </div>
+        <template v-else>
+          <div class="grid grid-cols-[minmax(120px,1.4fr)_minmax(140px,1.8fr)_minmax(140px,1.8fr)_56px_56px] gap-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
+            <span>描述</span>
+            <span>匹配</span>
+            <span>目标</span>
+            <span>状态码</span>
+            <span class="text-right">操作</span>
+          </div>
+          <div class="divide-y">
+            <div
+              v-for="r in redirectRules"
+              :key="r.id"
+              class="grid grid-cols-[minmax(120px,1.4fr)_minmax(140px,1.8fr)_minmax(140px,1.8fr)_56px_56px] items-center gap-2 px-4 py-3 text-sm hover:bg-accent/40"
+            >
+              <span class="truncate font-medium" :title="r.description">{{ r.description || '—' }}</span>
+              <code class="truncate font-mono text-xs text-muted-foreground" :title="r.expression">{{ r.expression }}</code>
+              <code class="truncate font-mono text-xs" :title="redirectTarget(r)">{{ redirectTarget(r) }}</code>
+              <span class="text-xs">{{ redirectStatus(r) }}</span>
+              <div class="flex justify-end">
+                <Button variant="ghost" size="icon-sm" class="text-muted-foreground hover:text-destructive" @click="deleteRedirectTarget = r">
+                  <Trash2 class="size-3.5" />
+                </Button>
+              </div>
+            </div>
+          </div>
+        </template>
+      </CardContent>
+    </Card>
+
     <!-- IP 访问规则 -->
     <Card>
       <CardHeader class="flex-row items-center justify-between space-y-0">
@@ -1148,6 +1358,87 @@ onMounted(() => {
         </template>
       </CardContent>
     </Card>
+
+    <!-- 添加重定向 -->
+    <Dialog v-model:open="addRedirectOpen">
+      <DialogContent class="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>添加重定向规则</DialogTitle>
+          <DialogDescription>来源填路径（如 /old 或 /blog/*）或完整 URL。目标必须是完整 URL。</DialogDescription>
+        </DialogHeader>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between rounded-md border px-3 py-2">
+            <Label>自定义表达式</Label>
+            <Switch
+              :model-value="redirectForm.customExpr"
+              @update:model-value="(v: boolean) => (redirectForm.customExpr = v)"
+            />
+          </div>
+          <div v-if="!redirectForm.customExpr" class="space-y-1.5">
+            <Label>来源路径 / URL</Label>
+            <Input v-model="redirectForm.source" placeholder="/old 或 https://example.com/old" class="font-mono" />
+          </div>
+          <div v-else class="space-y-1.5">
+            <Label>表达式</Label>
+            <Textarea v-model="redirectForm.expression" class="min-h-20 font-mono text-xs" spellcheck="false" />
+          </div>
+          <div class="space-y-1.5">
+            <Label>目标 URL</Label>
+            <Input v-model="redirectForm.target" placeholder="https://example.com/new" class="font-mono" />
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div class="space-y-1.5">
+              <Label>状态码</Label>
+              <Select v-model="redirectForm.status">
+                <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="301">301 永久</SelectItem>
+                  <SelectItem value="302">302 临时</SelectItem>
+                  <SelectItem value="307">307 临时（保留方法）</SelectItem>
+                  <SelectItem value="308">308 永久（保留方法）</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div class="flex items-end pb-1">
+              <label class="flex items-center gap-2 text-sm">
+                <Switch
+                  :model-value="redirectForm.preserveQuery"
+                  @update:model-value="(v: boolean) => (redirectForm.preserveQuery = v)"
+                />
+                保留查询串
+              </label>
+            </div>
+          </div>
+          <div class="space-y-1.5">
+            <Label>描述</Label>
+            <Input v-model="redirectForm.description" placeholder="可选" />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" @click="addRedirectOpen = false">取消</Button>
+          <Button :disabled="creatingRedirect" @click="submitAddRedirect">
+            {{ creatingRedirect ? '创建中…' : '创建' }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog :open="!!deleteRedirectTarget" @update:open="(v) => !v && (deleteRedirectTarget = null)">
+      <DialogContent class="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>删除重定向</DialogTitle>
+          <DialogDescription>
+            确定删除 {{ deleteRedirectTarget?.description || deleteRedirectTarget?.id }}？
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" @click="deleteRedirectTarget = null">取消</Button>
+          <Button variant="destructive" :disabled="deletingRedirect" @click="confirmDeleteRedirect">
+            {{ deletingRedirect ? '删除中…' : '确认删除' }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
 
     <!-- 添加 WAF 自定义规则 -->
     <Dialog v-model:open="addWafOpen">

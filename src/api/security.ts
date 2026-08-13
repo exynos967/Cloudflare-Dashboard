@@ -297,6 +297,38 @@ export const securityApi = {
 
   deleteCacheRule: (zoneId: string, ruleId: string) =>
     deletePhaseRule(zoneId, 'http_request_cache_settings', ruleId),
+
+  /** 单条重定向（Rulesets phase http_request_dynamic_redirect） */
+  listRedirectRules: (zoneId: string) =>
+    getPhaseSnapshot(zoneId, 'http_request_dynamic_redirect'),
+
+  createRedirectRule: (
+    zoneId: string,
+    data: {
+      expression: string
+      description?: string
+      enabled?: boolean
+      statusCode: 301 | 302 | 307 | 308
+      targetUrl: string
+      preserveQuery?: boolean
+    },
+  ) =>
+    addPhaseRule(zoneId, 'http_request_dynamic_redirect', 'Redirect rules', {
+      action: 'redirect',
+      expression: data.expression,
+      description: data.description,
+      enabled: data.enabled,
+      action_parameters: {
+        from_value: {
+          target_url: { value: data.targetUrl },
+          status_code: data.statusCode,
+          preserve_query_string: data.preserveQuery ?? true,
+        },
+      },
+    }),
+
+  deleteRedirectRule: (zoneId: string, ruleId: string) =>
+    deletePhaseRule(zoneId, 'http_request_dynamic_redirect', ruleId),
 }
 
 /* -------------------------------------------------------------------------- */
