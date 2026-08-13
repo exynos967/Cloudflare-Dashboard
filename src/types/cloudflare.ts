@@ -198,6 +198,14 @@ export interface PagesProject {
   modified_on: string
 }
 
+export interface PagesDomain {
+  id?: string
+  name: string
+  status?: string
+  verification_data?: { status?: string }
+  validation_data?: { status?: string }
+}
+
 export interface PagesDeployment {
   id: string
   environment: 'production' | 'preview'

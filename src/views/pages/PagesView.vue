@@ -9,10 +9,11 @@ import {
   RefreshCw,
   Rocket,
   Trash2,
+  Undo2,
 } from '@lucide/vue'
 import { pagesApi } from '@/api/pages'
 import { useAuthStore } from '@/stores/auth'
-import type { PagesDeployment, PagesProject } from '@/types/cloudflare'
+import type { PagesDeployment, PagesDomain, PagesProject } from '@/types/cloudflare'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -46,6 +47,14 @@ const currentAccountId = computed(() => auth.currentAccount?.accountId ?? '—')
 const current = ref<PagesProject | null>(null)
 const deployments = ref<PagesDeployment[]>([])
 const loadingDeployments = ref(false)
+const pageDomains = ref<PagesDomain[]>([])
+const loadingDomains = ref(false)
+const newDomain = ref('')
+const addingDomain = ref(false)
+const deleteDomainTarget = ref<PagesDomain | null>(null)
+const deletingDomain = ref(false)
+const rollbackTarget = ref<PagesDeployment | null>(null)
+const rollingBack = ref(false)
 
 // 新建项目
 const createOpen = ref(false)
@@ -103,11 +112,14 @@ async function submitCreate() {
 async function enterProject(p: PagesProject) {
   current.value = p
   deployments.value = []
-  await loadDeployments(p.name)
+  pageDomains.value = []
+  newDomain.value = ''
+  await Promise.all([loadDeployments(p.name), loadDomains(p.name)])
 }
 
 // 请求序号：快速切换项目时丢弃过期响应，避免 A 的部署记录显示在 B 下
 let deploymentsSeq = 0
+let domainsSeq = 0
 
 async function loadDeployments(name: string) {
   const seq = ++deploymentsSeq
@@ -124,10 +136,30 @@ async function loadDeployments(name: string) {
   }
 }
 
+async function loadDomains(name: string) {
+  const seq = ++domainsSeq
+  loadingDomains.value = true
+  try {
+    const list = await pagesApi.listDomains(name)
+    if (seq !== domainsSeq) return
+    pageDomains.value = list
+    if (current.value?.name === name) {
+      current.value = { ...current.value, domains: list.map((d) => d.name) }
+    }
+  } catch (e) {
+    if (seq !== domainsSeq) return
+    toast.error('加载自定义域失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    if (seq === domainsSeq) loadingDomains.value = false
+  }
+}
+
 function backToList() {
   deploymentsSeq++ // 作废在途请求，避免返回列表后过期响应写入状态
+  domainsSeq++
   current.value = null
   deployments.value = []
+  pageDomains.value = []
 }
 
 function confirmDelete(p: PagesProject) {
@@ -168,6 +200,69 @@ function stageStatus(d: PagesDeployment): string {
 
 function subdomainUrl(p: PagesProject): string {
   return `https://${p.subdomain}.pages.dev`
+}
+
+const DOMAIN_RE = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i
+
+async function addPageDomain() {
+  const host = newDomain.value.trim().toLowerCase()
+  if (!current.value || !host) return
+  if (!DOMAIN_RE.test(host)) {
+    toast.error('请输入合法域名，如 www.example.com')
+    return
+  }
+  addingDomain.value = true
+  try {
+    await pagesApi.addDomain(current.value.name, host)
+    toast.success('自定义域已添加，DNS 生效可能需要几分钟')
+    newDomain.value = ''
+    await loadDomains(current.value.name)
+  } catch (e) {
+    toast.error('添加失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    addingDomain.value = false
+  }
+}
+
+async function confirmDeleteDomain() {
+  if (!current.value || !deleteDomainTarget.value) return
+  deletingDomain.value = true
+  try {
+    await pagesApi.deleteDomain(current.value.name, deleteDomainTarget.value.name)
+    toast.success('自定义域已删除')
+    deleteDomainTarget.value = null
+    await loadDomains(current.value.name)
+  } catch (e) {
+    toast.error('删除失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    deletingDomain.value = false
+  }
+}
+
+function canRollback(d: PagesDeployment): boolean {
+  return d.environment === 'production' && d.latest_stage?.status === 'success'
+}
+
+async function confirmRollback() {
+  if (!current.value || !rollbackTarget.value) return
+  rollingBack.value = true
+  try {
+    await pagesApi.rollbackDeployment(current.value.name, rollbackTarget.value.id)
+    toast.success('已回滚到该部署')
+    rollbackTarget.value = null
+    await loadDeployments(current.value.name)
+  } catch (e) {
+    toast.error('回滚失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    rollingBack.value = false
+  }
+}
+
+function domainStatusClass(status?: string): string {
+  if (status === 'active') return 'bg-emerald-500/15 text-emerald-600'
+  if (status === 'pending' || status === 'initializing') return 'bg-amber-500/15 text-amber-600'
+  if (status === 'error' || status === 'deactivated') return 'bg-red-500/15 text-red-600'
+  return 'bg-muted text-muted-foreground'
 }
 </script>
 
@@ -303,22 +398,53 @@ function subdomainUrl(p: PagesProject): string {
               <ExternalLink class="size-3" />
             </a>
           </div>
-          <div v-if="current.domains.length" class="flex flex-wrap items-start gap-2">
-            <span class="w-24 pt-0.5 text-muted-foreground">自定义域</span>
-            <div class="flex flex-wrap gap-2">
-              <a
-                v-for="d in current.domains"
-                :key="d"
-                :href="`https://${d}`"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                <Badge variant="outline" class="gap-1 font-mono hover:bg-accent">
-                  <Globe class="size-3" />
-                  {{ d }}
-                  <ExternalLink class="size-3" />
-                </Badge>
-              </a>
+          <div class="space-y-2">
+            <div class="flex flex-wrap items-start gap-2">
+              <span class="w-24 pt-1.5 text-muted-foreground">自定义域</span>
+              <div class="min-w-0 flex-1 space-y-2">
+                <div class="flex gap-2">
+                  <Input v-model="newDomain" placeholder="www.example.com" class="font-mono" />
+                  <Button size="sm" :disabled="addingDomain || !newDomain.trim()" @click="addPageDomain">
+                    <Plus class="size-4" />
+                    添加
+                  </Button>
+                </div>
+                <div v-if="loadingDomains" class="space-y-2">
+                  <Skeleton class="h-8 w-full" />
+                </div>
+                <p v-else-if="!pageDomains.length" class="text-xs text-muted-foreground">暂无自定义域</p>
+                <ul v-else class="space-y-1.5">
+                  <li
+                    v-for="d in pageDomains"
+                    :key="d.name"
+                    class="flex items-center justify-between gap-2 rounded-md border px-2 py-1.5"
+                  >
+                    <a
+                      :href="`https://${d.name}`"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      class="inline-flex min-w-0 items-center gap-1 font-mono text-xs text-primary hover:underline"
+                    >
+                      <Globe class="size-3 shrink-0" />
+                      <span class="truncate">{{ d.name }}</span>
+                      <ExternalLink class="size-3 shrink-0" />
+                    </a>
+                    <div class="flex items-center gap-1">
+                      <Badge v-if="d.status" variant="secondary" :class="domainStatusClass(d.status)">
+                        {{ d.status }}
+                      </Badge>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        class="text-muted-foreground hover:text-destructive"
+                        @click="deleteDomainTarget = d"
+                      >
+                        <Trash2 class="size-3.5" />
+                      </Button>
+                    </div>
+                  </li>
+                </ul>
+              </div>
             </div>
           </div>
         </CardContent>
@@ -356,6 +482,7 @@ function subdomainUrl(p: PagesProject): string {
                   <th class="px-2 py-2 font-medium">状态</th>
                   <th class="px-2 py-2 font-medium">提交信息</th>
                   <th class="px-2 py-2 font-medium">创建时间</th>
+                  <th class="px-2 py-2 text-right font-medium">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -378,6 +505,17 @@ function subdomainUrl(p: PagesProject): string {
                   </td>
                   <td class="whitespace-nowrap px-2 py-2 text-xs text-muted-foreground">
                     {{ fmtDate(d.created_on) }}
+                  </td>
+                  <td class="px-2 py-2 text-right">
+                    <Button
+                      v-if="canRollback(d)"
+                      variant="outline"
+                      size="sm"
+                      @click="rollbackTarget = d"
+                    >
+                      <Undo2 class="size-3.5" />
+                      回滚
+                    </Button>
                   </td>
                 </tr>
               </tbody>
@@ -441,6 +579,43 @@ function subdomainUrl(p: PagesProject): string {
           <Button variant="outline" @click="deleteTarget = null">取消</Button>
           <Button variant="destructive" :disabled="deleting" @click="doDelete">
             {{ deleting ? '删除中…' : '确认删除' }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+    <!-- 删除自定义域 -->
+    <Dialog :open="!!deleteDomainTarget" @update:open="(v) => !v && (deleteDomainTarget = null)">
+      <DialogContent class="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>删除自定义域</DialogTitle>
+          <DialogDescription>
+            确定从项目移除 <code class="rounded bg-muted px-1 font-mono">{{ deleteDomainTarget?.name }}</code>？DNS 记录不会自动删除。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" @click="deleteDomainTarget = null">取消</Button>
+          <Button variant="destructive" :disabled="deletingDomain" @click="confirmDeleteDomain">
+            {{ deletingDomain ? '删除中…' : '确认删除' }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <!-- 回滚确认 -->
+    <Dialog :open="!!rollbackTarget" @update:open="(v) => !v && (rollbackTarget = null)">
+      <DialogContent class="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>回滚部署</DialogTitle>
+          <DialogDescription>
+            确定将生产环境回滚到部署
+            <code class="rounded bg-muted px-1 font-mono">{{ rollbackTarget?.id }}</code>
+            （{{ rollbackTarget ? fmtDate(rollbackTarget.created_on) : '' }}）？将立即创建一次新的生产部署。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" @click="rollbackTarget = null">取消</Button>
+          <Button :disabled="rollingBack" @click="confirmRollback">
+            {{ rollingBack ? '回滚中…' : '确认回滚' }}
           </Button>
         </DialogFooter>
       </DialogContent>

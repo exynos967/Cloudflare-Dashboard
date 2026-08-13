@@ -1,6 +1,6 @@
 import { http, listAll } from './client'
 import { useAuthStore } from '@/stores/auth'
-import type { PagesProject, PagesDeployment } from '@/types/cloudflare'
+import type { PagesDomain, PagesProject, PagesDeployment } from '@/types/cloudflare'
 
 /** 取当前账号的 Cloudflare account id（account 维度调用的前缀） */
 function accountId(): string {
@@ -41,4 +41,20 @@ export const pagesApi = {
   /** 获取单个部署详情 */
   getDeployment: (name: string, id: string) =>
     http.get<PagesDeployment>(`${projectBase(name)}/deployments/${id}`),
+
+  /**
+   * 回滚到指定部署。官方：POST .../deployments/{id}/rollback
+   * 仅生产环境成功部署可回滚；失败由 CF 返回错误信息。
+   */
+  rollbackDeployment: (name: string, deploymentId: string) =>
+    http.post<PagesDeployment>(`${projectBase(name)}/deployments/${deploymentId}/rollback`),
+
+  listDomains: (name: string) =>
+    listAll<PagesDomain>(`${projectBase(name)}/domains`, {}, { perPage: 20 }),
+
+  addDomain: (name: string, domain: string) =>
+    http.post<PagesDomain>(`${projectBase(name)}/domains`, { body: { name: domain } }),
+
+  deleteDomain: (name: string, domain: string) =>
+    http.delete<void>(`${projectBase(name)}/domains/${encodeURIComponent(domain)}`),
 }
