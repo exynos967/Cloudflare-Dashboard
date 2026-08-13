@@ -81,6 +81,7 @@ import {
 import { usePresetsStore } from '@/stores/presets'
 import DNSRecordManager from '@/components/dns/DNSRecordManager.vue'
 import ZoneSecurityRules from '@/components/zones/ZoneSecurityRules.vue'
+import ZoneEmailRouting from '@/components/zones/ZoneEmailRouting.vue'
 import type { Zone } from '@/types/cloudflare'
 
 const route = useRoute()
@@ -666,6 +667,7 @@ function fmtDate(s: string | null): string {
         <TabsTrigger value="cache">缓存</TabsTrigger>
         <TabsTrigger value="preset">配置预设</TabsTrigger>
         <TabsTrigger value="security">安全规则</TabsTrigger>
+        <TabsTrigger value="email">Email</TabsTrigger>
         <TabsTrigger value="overview">概览</TabsTrigger>
       </TabsList>
 
@@ -907,6 +909,10 @@ function fmtDate(s: string | null): string {
       <TabsContent value="security" class="mt-4">
         <!-- key 绑定 zoneId：切 zone 强制重建实例，杜绝旧实例在途响应写入 -->
         <ZoneSecurityRules :key="zoneId" :zone-id="zoneId" />
+      </TabsContent>
+
+      <TabsContent value="email" class="mt-4">
+        <ZoneEmailRouting :key="zoneId" :zone-id="zoneId" :zone-name="zone?.name" />
       </TabsContent>
 
       <!-- 预设编辑器 -->
