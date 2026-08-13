@@ -119,6 +119,7 @@ watch(zoneId, () => {
   loadError.value = null
   zoneSettings.value = {}
   settingsError.value = null
+  purgeFilesText.value = ''
   load()
   if (activeTab.value === 'preset') loadZoneSettings()
 })
@@ -143,7 +144,7 @@ function purgeAll() {
 
 function parsePurgeUrls(): string[] | null {
   const lines = purgeFilesText.value
-    .split(/[\n,]+/)
+    .split(/\r?\n/)
     .map((s) => s.trim())
     .filter(Boolean)
   if (!lines.length) {
@@ -162,8 +163,8 @@ function parsePurgeUrls(): string[] | null {
       return null
     }
   }
-  if (lines.length > 30) {
-    toast.error('单次最多 30 条 URL（Cloudflare 免费档限制）')
+  if (lines.length > 100) {
+    toast.error('单次最多 100 条 URL（Cloudflare 单请求上限）')
     return null
   }
   return lines
@@ -171,28 +172,35 @@ function parsePurgeUrls(): string[] | null {
 
 async function purgeByUrls() {
   const files = parsePurgeUrls()
-  if (!files || !zoneId.value) return
+  const id = zoneId.value
+  if (!files || !id) return
   purgingFiles.value = true
   try {
-    await zonesApi.purgeCache(zoneId.value, files)
+    await zonesApi.purgeCache(id, files)
+    if (id !== zoneId.value) return
     toast.success(`已提交清除 ${files.length} 条 URL`)
   } catch (e) {
+    if (id !== zoneId.value) return
     toast.error('按 URL 清除失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
-    purgingFiles.value = false
+    if (id === zoneId.value) purgingFiles.value = false
   }
 }
 
 async function confirmPurgeAll() {
   purgeConfirmOpen.value = false
+  const id = zoneId.value
+  if (!id) return
   purging.value = true
   try {
-    await zonesApi.purgeCache(zoneId.value)
+    await zonesApi.purgeCache(id)
+    if (id !== zoneId.value) return
     toast.success('缓存已清除')
   } catch (e) {
+    if (id !== zoneId.value) return
     toast.error('清除缓存失败', { description: e instanceof Error ? e.message : String(e) })
   } finally {
-    purging.value = false
+    if (id === zoneId.value) purging.value = false
   }
 }
 
@@ -662,6 +670,7 @@ function fmtDate(s: string | null): string {
 
     <!-- Tabs -->
     <Tabs v-model="activeTab" class="w-full">
+      <div class="overflow-x-auto">
       <TabsList>
         <TabsTrigger value="dns">DNS 记录</TabsTrigger>
         <TabsTrigger value="cache">缓存</TabsTrigger>
@@ -670,6 +679,7 @@ function fmtDate(s: string | null): string {
         <TabsTrigger value="email">Email</TabsTrigger>
         <TabsTrigger value="overview">概览</TabsTrigger>
       </TabsList>
+      </div>
 
       <!-- DNS 记录 -->
       <TabsContent value="dns" class="mt-4">
@@ -707,14 +717,14 @@ function fmtDate(s: string | null): string {
                   class="min-h-24 font-mono text-xs"
                   placeholder="每行一个完整 URL，如&#10;https://example.com/app.js"
                 />
-                <p class="text-xs text-muted-foreground">须为 UTF-8 完整 URL，不支持通配符。免费档单次最多 30 条。</p>
+                <p class="text-xs text-muted-foreground">每行一条 UTF-8 完整 URL，不支持通配符。单次最多 100 条。</p>
               </div>
               <div class="flex flex-wrap gap-2">
-                <Button size="sm" :disabled="purgingFiles || !zone" @click="purgeByUrls">
+                <Button size="sm" :disabled="purgingFiles || purging || !zone" @click="purgeByUrls">
                   <Loader2 v-if="purgingFiles" class="size-4 animate-spin" />
                   清除这些 URL
                 </Button>
-                <Button variant="destructive" size="sm" :disabled="purging || !zone" @click="purgeAll">
+                <Button variant="destructive" size="sm" :disabled="purging || purgingFiles || !zone" @click="purgeAll">
                   <Loader2 v-if="purging" class="size-4 animate-spin" />
                   清除全部缓存
                 </Button>
