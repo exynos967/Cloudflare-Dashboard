@@ -139,7 +139,7 @@ async function loadWorkers() {
   workerTotal.value = 0
   const { since, until } = computeRange(range.value)
   try {
-    const res = await accountWorkers(accountId, since, until)
+    const res = await accountWorkers(accountId, since, until, range.value === '24h' ? 'hour' : 'day')
     if (seq !== workersSeq) return
     workerRows.value = res.rows
     workerTotal.value = res.total

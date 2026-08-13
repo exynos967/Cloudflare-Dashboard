@@ -92,7 +92,7 @@ interface Raw1dGroup {
 }
 interface RawWorkerGroup {
   sum?: { requests?: number; subrequests?: number; errors?: number }
-  dimensions?: { date?: string; scriptName?: string }
+  dimensions?: { date?: string; datetimeHour?: string; scriptName?: string }
 }
 
 interface Zone1hResp {
@@ -401,20 +401,22 @@ export async function zoneTopCountries(
 
 /**
  * 查询 account 维度的 Workers 调用统计（workersInvocationsAdaptive）。
- * 可选能力：若账号未启用 Workers 或无数据，CF 可能返回空数组。
+ * 24h 用小时维度，更长范围用日维度，避免折线只剩 1～2 个点。
  */
 export async function accountWorkers(
   accountId: string,
   since: string,
   until: string,
+  granularity: 'hour' | 'day' = 'day',
 ): Promise<AccountWorkersResult> {
+  const timeField = granularity === 'hour' ? 'datetimeHour' : 'date'
   const query = `{
   viewer {
     accounts(filter: {accountTag: ${JSON.stringify(accountId)}}) {
       workersInvocationsAdaptive(
         limit: 1000
         filter: {datetime_geq: ${JSON.stringify(since)}, datetime_lt: ${JSON.stringify(until)}}
-        orderBy: [date_ASC]
+        orderBy: [${timeField}_ASC]
       ) {
         sum {
           requests
@@ -422,7 +424,7 @@ export async function accountWorkers(
           errors
         }
         dimensions {
-          date
+          ${timeField}
           scriptName
         }
       }
@@ -436,8 +438,9 @@ export async function accountWorkers(
     const s = g.sum ?? {}
     const d = g.dimensions ?? {}
     total += s.requests ?? 0
+    const raw = granularity === 'hour' ? d.datetimeHour : d.date
     return {
-      label: d.date ? fmtDayLabel(d.date) : '',
+      label: raw ? (granularity === 'hour' ? fmtMinuteLabel(raw) : fmtDayLabel(raw)) : '',
       script: d.scriptName ?? '—',
       requests: s.requests ?? 0,
       errors: s.errors ?? 0,
