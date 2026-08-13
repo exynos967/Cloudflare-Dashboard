@@ -8,10 +8,12 @@ import {
   Pencil,
   Trash2,
   Upload,
+  Download,
   Copy,
   Cloud,
   Loader2,
   Lock,
+  Shield,
 } from '@lucide/vue'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -45,6 +47,7 @@ import {
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { dnsApi, workersApi, pagesApi, listAll } from '@/api'
+import type { DnssecInfo } from '@/api'
 import type { DNSRecord, DNSRecordPayload, DNSRecordType } from '@/types/cloudflare'
 
 const props = defineProps<{ zoneId: string; zoneName?: string }>()
@@ -108,7 +111,78 @@ async function load() {
   }
 }
 
-watch(() => props.zoneId, load, { immediate: true })
+watch(
+  () => props.zoneId,
+  () => {
+    load()
+    loadDnssec()
+  },
+  { immediate: true },
+)
+
+/* ---------------- BIND 导出 / DNSSEC 只读 ---------------- */
+
+const exporting = ref(false)
+const dnssec = ref<DnssecInfo | null>(null)
+const dnssecLoading = ref(false)
+const dnssecError = ref('')
+const dnssecOpen = ref(false)
+
+async function loadDnssec() {
+  if (!props.zoneId) return
+  dnssecLoading.value = true
+  dnssecError.value = ''
+  dnssec.value = null
+  try {
+    dnssec.value = await dnsApi.getDnssec(props.zoneId)
+  } catch (e) {
+    dnssecError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    dnssecLoading.value = false
+  }
+}
+
+const DNSSEC_STATUS_LABEL: Record<string, string> = {
+  active: 'DNSSEC 已启用',
+  pending: 'DNSSEC 待生效',
+  disabled: 'DNSSEC 未启用',
+  'pending-disabled': 'DNSSEC 停用中',
+  error: 'DNSSEC 异常',
+}
+
+function dnssecBadgeClass(status?: string): string {
+  if (status === 'active') return 'bg-emerald-500/15 text-emerald-600'
+  if (status === 'pending' || status === 'pending-disabled') return 'bg-amber-500/15 text-amber-600'
+  if (status === 'error') return 'bg-red-500/15 text-red-600'
+  return 'bg-muted text-muted-foreground'
+}
+
+function dnssecLabel(): string {
+  if (dnssecLoading.value) return 'DNSSEC…'
+  if (dnssecError.value) return 'DNSSEC 不可用'
+  const s = dnssec.value?.status ?? 'disabled'
+  return DNSSEC_STATUS_LABEL[s] ?? `DNSSEC ${s}`
+}
+
+async function exportBind() {
+  if (!props.zoneId || exporting.value) return
+  exporting.value = true
+  try {
+    const text = await dnsApi.exportBind(props.zoneId)
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${props.zoneName || props.zoneId}.zone.txt`
+    a.click()
+    URL.revokeObjectURL(url)
+    toast.success('已导出 BIND zone 文件')
+  } catch (e) {
+    toast.error('导出失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    exporting.value = false
+  }
+}
 
 /* ---------------- 过滤与分页 ---------------- */
 
@@ -674,9 +748,23 @@ function typeClass(type: DNSRecordType): string {
       </Select>
 
       <div class="ml-auto flex items-center gap-2">
+        <Badge
+          variant="secondary"
+          class="h-8 cursor-pointer gap-1 px-2.5"
+          :class="dnssecBadgeClass(dnssec?.status)"
+          :title="dnssecError || '查看 DNSSEC 详情（只读）'"
+          @click="dnssecOpen = true"
+        >
+          <Shield class="size-3.5" />
+          {{ dnssecLabel() }}
+        </Badge>
         <Button variant="ghost" size="sm" :disabled="loading" @click="load">
           <RefreshCw class="size-4" :class="{ 'animate-spin': loading }" />
           刷新
+        </Button>
+        <Button variant="outline" size="sm" :disabled="exporting" @click="exportBind">
+          <component :is="exporting ? Loader2 : Download" class="size-4" :class="{ 'animate-spin': exporting }" />
+          导出 BIND
         </Button>
         <Button variant="outline" size="sm" :disabled="importing" @click="pickFile">
           <component :is="importing ? Loader2 : Upload" class="size-4" :class="{ 'animate-spin': importing }" />
@@ -1011,6 +1099,53 @@ function typeClass(type: DNSRecordType): string {
             <Loader2 v-if="deleting" class="size-4 animate-spin" />
             删除
           </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <!-- DNSSEC 只读 -->
+    <Dialog v-model:open="dnssecOpen">
+      <DialogContent class="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>DNSSEC</DialogTitle>
+          <DialogDescription>只读展示当前 zone 的 DNSSEC 状态与 DS 记录，启用/关闭请前往 Cloudflare 仪表板。</DialogDescription>
+        </DialogHeader>
+        <div v-if="dnssecLoading" class="space-y-2">
+          <Skeleton class="h-5 w-40" />
+          <Skeleton class="h-16 w-full" />
+        </div>
+        <div v-else-if="dnssecError" class="text-sm text-destructive">{{ dnssecError }}</div>
+        <div v-else class="space-y-3 text-sm">
+          <div class="flex items-center gap-2">
+            <span class="w-24 text-muted-foreground">状态</span>
+            <Badge variant="secondary" :class="dnssecBadgeClass(dnssec?.status)">
+              {{ DNSSEC_STATUS_LABEL[dnssec?.status ?? ''] ?? (dnssec?.status || '未知') }}
+            </Badge>
+          </div>
+          <div v-if="dnssec?.algorithm" class="flex items-center gap-2">
+            <span class="w-24 text-muted-foreground">算法</span>
+            <span class="font-mono">{{ dnssec.algorithm }}{{ dnssec.digest_algorithm ? ` / ${dnssec.digest_algorithm}` : '' }}</span>
+          </div>
+          <div v-if="dnssec?.key_tag != null" class="flex items-center gap-2">
+            <span class="w-24 text-muted-foreground">Key Tag</span>
+            <span class="font-mono">{{ dnssec.key_tag }}</span>
+          </div>
+          <div v-if="dnssec?.ds" class="space-y-1.5">
+            <div class="flex items-center justify-between">
+              <span class="text-muted-foreground">DS 记录</span>
+              <Button variant="ghost" size="sm" @click="copy(dnssec.ds, 'DS 记录')">
+                <Copy class="size-3.5" />
+                复制
+              </Button>
+            </div>
+            <pre class="overflow-x-auto rounded-md border bg-muted/40 p-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap">{{ dnssec.ds }}</pre>
+          </div>
+          <p v-if="!dnssec?.ds && (dnssec?.status === 'disabled' || !dnssec?.status)" class="text-muted-foreground">
+            当前未启用 DNSSEC，没有可复制的 DS 记录。
+          </p>
+        </div>
+        <DialogFooter>
+          <Button @click="dnssecOpen = false">关闭</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
