@@ -8,6 +8,7 @@ import {
   Trash2,
   Play,
   Table2,
+  Columns3,
   Terminal,
   AlertTriangle,
   ChevronLeft,
@@ -238,7 +239,18 @@ async function loadBrowse() {
     ])
     const n = Number((countRs?.[0]?.results?.[0] as { n?: number } | undefined)?.n ?? 0)
     browseTotal.value = Number.isFinite(n) ? n : 0
-    browseRows.value = dataRs?.[0]?.results ?? []
+    const pages = Math.max(1, Math.ceil(browseTotal.value / PAGE_SIZE))
+    if (browsePage.value > pages) {
+      browsePage.value = pages
+      const retryOffset = (browsePage.value - 1) * PAGE_SIZE
+      const retryRs = await d1Api.query(
+        selected.value.uuid,
+        `SELECT * FROM ${ident} LIMIT ${PAGE_SIZE} OFFSET ${retryOffset}`,
+      )
+      browseRows.value = retryRs?.[0]?.results ?? []
+    } else {
+      browseRows.value = dataRs?.[0]?.results ?? []
+    }
   } catch (e) {
     browseError.value = e instanceof Error ? e.message : String(e)
     browseRows.value = []
