@@ -23,6 +23,7 @@ import { Switch } from '@/components/ui/switch'
 import { Label } from '@/components/ui/label'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import {
   Select,
   SelectContent,
@@ -129,12 +130,56 @@ watch(activeTab, (t) => {
 /* ---------------- 缓存管理 ---------------- */
 
 const purging = ref(false)
+const purgingFiles = ref(false)
+const purgeFilesText = ref('')
 const devModeLoading = ref(false)
 /** 清除缓存二次确认（项目统一 Dialog，不用原生 confirm） */
 const purgeConfirmOpen = ref(false)
 
 function purgeAll() {
   purgeConfirmOpen.value = true
+}
+
+function parsePurgeUrls(): string[] | null {
+  const lines = purgeFilesText.value
+    .split(/[\n,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  if (!lines.length) {
+    toast.error('请输入至少一个完整 URL')
+    return null
+  }
+  for (const u of lines) {
+    try {
+      const parsed = new URL(u)
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        toast.error(`不是 http(s) URL：${u}`)
+        return null
+      }
+    } catch {
+      toast.error(`URL 不合法：${u}`)
+      return null
+    }
+  }
+  if (lines.length > 30) {
+    toast.error('单次最多 30 条 URL（Cloudflare 免费档限制）')
+    return null
+  }
+  return lines
+}
+
+async function purgeByUrls() {
+  const files = parsePurgeUrls()
+  if (!files || !zoneId.value) return
+  purgingFiles.value = true
+  try {
+    await zonesApi.purgeCache(zoneId.value, files)
+    toast.success(`已提交清除 ${files.length} 条 URL`)
+  } catch (e) {
+    toast.error('按 URL 清除失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    purgingFiles.value = false
+  }
 }
 
 async function confirmPurgeAll() {
@@ -650,16 +695,28 @@ function fmtDate(s: string | null): string {
                 <Zap class="size-4 text-amber-500" />
                 清除缓存
               </CardTitle>
-              <CardDescription>一键清除该域名下的所有缓存资源</CardDescription>
+              <CardDescription>优先按 URL 清除；全站清除会影响全部边缘缓存</CardDescription>
             </CardHeader>
-            <CardContent>
-              <Button variant="destructive" :disabled="purging || !zone" @click="purgeAll">
-                <Loader2 v-if="purging" class="size-4 animate-spin" />
-                清除全部缓存
-              </Button>
-              <p class="mt-2 text-xs text-muted-foreground">
-                清除后访问者将回源重新拉取最新内容
-              </p>
+            <CardContent class="space-y-3">
+              <div class="space-y-1.5">
+                <Label>按 URL 清除</Label>
+                <Textarea
+                  v-model="purgeFilesText"
+                  class="min-h-24 font-mono text-xs"
+                  placeholder="每行一个完整 URL，如&#10;https://example.com/app.js"
+                />
+                <p class="text-xs text-muted-foreground">须为 UTF-8 完整 URL，不支持通配符。免费档单次最多 30 条。</p>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <Button size="sm" :disabled="purgingFiles || !zone" @click="purgeByUrls">
+                  <Loader2 v-if="purgingFiles" class="size-4 animate-spin" />
+                  清除这些 URL
+                </Button>
+                <Button variant="destructive" size="sm" :disabled="purging || !zone" @click="purgeAll">
+                  <Loader2 v-if="purging" class="size-4 animate-spin" />
+                  清除全部缓存
+                </Button>
+              </div>
             </CardContent>
           </Card>
 
