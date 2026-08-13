@@ -29,6 +29,7 @@ const extensions = computed(() => {
   <div class="overflow-hidden rounded-md border" :class="disabled ? 'pointer-events-none opacity-60' : ''">
     <Codemirror
       :model-value="modelValue"
+      :disabled="disabled"
       :extensions="extensions"
       :indent-with-tab="true"
       :tab-size="2"
