@@ -329,6 +329,9 @@ export const securityApi = {
 
   deleteRedirectRule: (zoneId: string, ruleId: string) =>
     deletePhaseRule(zoneId, 'http_request_dynamic_redirect', ruleId),
+
+  setRedirectRuleEnabled: (zoneId: string, rule: RulesetRule, enabled: boolean) =>
+    patchPhaseRule(zoneId, 'http_request_dynamic_redirect', rule, { enabled }),
 }
 
 /* -------------------------------------------------------------------------- */

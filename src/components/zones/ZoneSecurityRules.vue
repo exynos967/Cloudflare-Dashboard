@@ -460,6 +460,21 @@ async function submitAddRedirect() {
 
 const deleteRedirectTarget = ref<RulesetRule | null>(null)
 const deletingRedirect = ref(false)
+const redirectToggling = ref<string | null>(null)
+
+async function toggleRedirectEnabled(rule: RulesetRule, enabled: boolean) {
+  if (!props.zoneId || redirectToggling.value) return
+  redirectToggling.value = rule.id
+  try {
+    await securityApi.setRedirectRuleEnabled(props.zoneId, rule, enabled)
+    rule.enabled = enabled
+    toast.success(enabled ? '已启用' : '已禁用')
+  } catch (e) {
+    toast.error('切换失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    redirectToggling.value = null
+  }
+}
 
 async function confirmDeleteRedirect() {
   if (!deleteRedirectTarget.value || !props.zoneId) return
@@ -1165,23 +1180,29 @@ onMounted(() => {
           </Button>
         </div>
         <template v-else>
-          <div class="grid grid-cols-[minmax(120px,1.4fr)_minmax(140px,1.8fr)_minmax(140px,1.8fr)_56px_56px] gap-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
+          <div class="grid grid-cols-[minmax(120px,1.4fr)_minmax(140px,1.8fr)_minmax(140px,1.8fr)_56px_70px_56px] gap-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
             <span>描述</span>
             <span>匹配</span>
             <span>目标</span>
             <span>状态码</span>
+            <span>启用</span>
             <span class="text-right">操作</span>
           </div>
           <div class="divide-y">
             <div
               v-for="r in redirectRules"
               :key="r.id"
-              class="grid grid-cols-[minmax(120px,1.4fr)_minmax(140px,1.8fr)_minmax(140px,1.8fr)_56px_56px] items-center gap-2 px-4 py-3 text-sm hover:bg-accent/40"
+              class="grid grid-cols-[minmax(120px,1.4fr)_minmax(140px,1.8fr)_minmax(140px,1.8fr)_56px_70px_56px] items-center gap-2 px-4 py-3 text-sm hover:bg-accent/40"
             >
               <span class="truncate font-medium" :title="r.description">{{ r.description || '—' }}</span>
               <code class="truncate font-mono text-xs text-muted-foreground" :title="r.expression">{{ r.expression }}</code>
               <code class="truncate font-mono text-xs" :title="redirectTarget(r)">{{ redirectTarget(r) }}</code>
               <span class="text-xs">{{ redirectStatus(r) }}</span>
+              <Switch
+                :model-value="r.enabled"
+                :disabled="redirectToggling === r.id"
+                @update:model-value="(v: boolean) => toggleRedirectEnabled(r, v)"
+              />
               <div class="flex justify-end">
                 <Button variant="ghost" size="icon-sm" class="text-muted-foreground hover:text-destructive" @click="deleteRedirectTarget = r">
                   <Trash2 class="size-3.5" />
