@@ -10,7 +10,8 @@ import {
   Table2,
   Terminal,
   AlertTriangle,
-  Columns3,
+  ChevronLeft,
+  ChevronRight,
 } from '@lucide/vue'
 import { d1Api } from '@/api/d1'
 import type { D1Database, D1QueryResult } from '@/types/cloudflare'
@@ -184,16 +185,18 @@ watch(selected, (db) => {
   results.value = []
   error.value = ''
   ranAt.value = ''
+  browseRows.value = []
+  browseTotal.value = 0
+  browsePage.value = 1
   if (db) loadTables()
 })
 
 async function onTableChange(name: string) {
   tableSel.value = name
   if (!selected.value || !name) return
-  // 点击表名：插入常用查询到 SQL 编辑器
   sql.value = `SELECT * FROM ${quoteIdent(name)} LIMIT 100;`
-  // 同时加载表结构
   colsLoading.value = true
+  browsePage.value = 1
   try {
     tableCols.value = await d1Api.tableInfo(selected.value.uuid, name)
   } catch (e) {
@@ -202,10 +205,59 @@ async function onTableChange(name: string) {
   } finally {
     colsLoading.value = false
   }
+  await loadBrowse()
 }
 
 function quoteIdent(name: string): string {
   return '"' + String(name).replace(/"/g, '""') + '"'
+}
+
+const PAGE_SIZE = 50
+const browseRows = ref<Record<string, unknown>[]>([])
+const browseTotal = ref(0)
+const browsePage = ref(1)
+const browseLoading = ref(false)
+const browseError = ref('')
+const browseCols = computed(() => {
+  const keys = new Set<string>()
+  for (const row of browseRows.value) for (const k of Object.keys(row)) keys.add(k)
+  return [...keys]
+})
+const browsePages = computed(() => Math.max(1, Math.ceil(browseTotal.value / PAGE_SIZE)))
+
+async function loadBrowse() {
+  if (!selected.value || !tableSel.value) return
+  browseLoading.value = true
+  browseError.value = ''
+  try {
+    const ident = quoteIdent(tableSel.value)
+    const offset = (browsePage.value - 1) * PAGE_SIZE
+    const [countRs, dataRs] = await Promise.all([
+      d1Api.query(selected.value.uuid, `SELECT COUNT(*) AS n FROM ${ident}`),
+      d1Api.query(selected.value.uuid, `SELECT * FROM ${ident} LIMIT ${PAGE_SIZE} OFFSET ${offset}`),
+    ])
+    const n = Number((countRs?.[0]?.results?.[0] as { n?: number } | undefined)?.n ?? 0)
+    browseTotal.value = Number.isFinite(n) ? n : 0
+    browseRows.value = dataRs?.[0]?.results ?? []
+  } catch (e) {
+    browseError.value = e instanceof Error ? e.message : String(e)
+    browseRows.value = []
+    browseTotal.value = 0
+  } finally {
+    browseLoading.value = false
+  }
+}
+
+async function browsePrev() {
+  if (browsePage.value <= 1) return
+  browsePage.value -= 1
+  await loadBrowse()
+}
+
+async function browseNext() {
+  if (browsePage.value >= browsePages.value) return
+  browsePage.value += 1
+  await loadBrowse()
 }
 
 function insertSql(snippet: string) {
@@ -474,6 +526,55 @@ function displayVal(v: unknown): string {
                   </tbody>
                 </table>
               </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card v-if="tableSel">
+          <CardHeader class="pb-3">
+            <div class="flex items-center justify-between gap-2">
+              <CardTitle class="flex items-center gap-2 text-sm">
+                <Table2 class="size-4" />
+                表数据 · {{ tableSel }}
+              </CardTitle>
+              <div class="flex items-center gap-2 text-xs text-muted-foreground">
+                <span>共 {{ browseTotal }} 行</span>
+                <Button variant="outline" size="sm" :disabled="browseLoading" @click="loadBrowse">
+                  <RefreshCw class="size-3.5" :class="{ 'animate-spin': browseLoading }" />
+                </Button>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent class="pt-0">
+            <p v-if="browseError" class="text-sm text-destructive">{{ browseError }}</p>
+            <div v-else-if="browseLoading" class="space-y-2">
+              <Skeleton v-for="i in 5" :key="i" class="h-8 w-full" />
+            </div>
+            <p v-else-if="!browseRows.length" class="py-8 text-center text-sm text-muted-foreground">表是空的</p>
+            <div v-else class="overflow-x-auto rounded-md border">
+              <table class="w-full text-xs">
+                <thead class="bg-muted/50">
+                  <tr class="text-left">
+                    <th v-for="c in browseCols" :key="c" class="whitespace-nowrap px-3 py-1.5 font-medium">{{ c }}</th>
+                  </tr>
+                </thead>
+                <tbody class="font-mono">
+                  <tr v-for="(row, i) in browseRows" :key="i" class="border-t hover:bg-accent/30">
+                    <td v-for="c in browseCols" :key="c" class="max-w-[240px] truncate px-3 py-1.5" :title="displayVal(row[c])">
+                      {{ displayVal(row[c]) }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div v-if="browseTotal > PAGE_SIZE" class="mt-3 flex items-center justify-end gap-2">
+              <Button variant="outline" size="sm" :disabled="browsePage <= 1 || browseLoading" @click="browsePrev">
+                <ChevronLeft class="size-4" />
+              </Button>
+              <span class="text-xs text-muted-foreground">{{ browsePage }} / {{ browsePages }}</span>
+              <Button variant="outline" size="sm" :disabled="browsePage >= browsePages || browseLoading" @click="browseNext">
+                <ChevronRight class="size-4" />
+              </Button>
             </div>
           </CardContent>
         </Card>
