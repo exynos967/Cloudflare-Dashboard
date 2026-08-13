@@ -10,11 +10,13 @@ import {
   Gauge,
   RefreshCw,
   Activity,
+  Server,
 } from '@lucide/vue'
 import VChart from 'vue-echarts'
-import { zonesApi, zoneTraffic, zoneTopCountries } from '@/api'
+import { zonesApi, zoneTraffic, zoneTopCountries, accountWorkers } from '@/api'
+import { useAuthStore } from '@/stores/auth'
 import type { Zone } from '@/types/cloudflare'
-import type { CountryRow, TimePoint, ZoneSummary } from '@/api/analytics'
+import type { CountryRow, TimePoint, WorkerInvocationRow, ZoneSummary } from '@/api/analytics'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Badge } from '@/components/ui/badge'
@@ -61,6 +63,13 @@ const summary = ref<ZoneSummary | null>(null)
 const countries = ref<CountryRow[]>([])
 const loading = ref(false)
 const errorMsg = ref('')
+
+const workerRows = ref<WorkerInvocationRow[]>([])
+const workerTotal = ref(0)
+const workerLoading = ref(false)
+const workerError = ref('')
+
+const auth = useAuthStore()
 
 const hasData = computed(() => points.value.length > 0)
 
@@ -118,6 +127,30 @@ async function loadAnalytics() {
   }
 }
 
+let workersSeq = 0
+
+async function loadWorkers() {
+  const accountId = auth.currentAccount?.accountId
+  if (!accountId) return
+  const seq = ++workersSeq
+  workerLoading.value = true
+  workerError.value = ''
+  workerRows.value = []
+  workerTotal.value = 0
+  const { since, until } = computeRange(range.value)
+  try {
+    const res = await accountWorkers(accountId, since, until)
+    if (seq !== workersSeq) return
+    workerRows.value = res.rows
+    workerTotal.value = res.total
+  } catch (e) {
+    if (seq !== workersSeq) return
+    workerError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    if (seq === workersSeq) workerLoading.value = false
+  }
+}
+
 /* ---------- 主题响应 ---------- */
 
 /** 主题切换（html 的 class/attribute 变化）时 bump，驱动图表 computed 重取 CSS 变量配色 */
@@ -127,6 +160,7 @@ let themeObserver: MutationObserver | null = null
 onMounted(() => {
   // loadZones 设置 selectedZoneId 后由下方 watch 触发 loadAnalytics，首屏只发一组请求
   loadZones()
+  loadWorkers()
   themeObserver = new MutationObserver(() => {
     themeVersion.value++
   })
@@ -141,6 +175,8 @@ onUnmounted(() => {
 watch([selectedZoneId, range], () => {
   if (selectedZoneId.value) loadAnalytics()
 })
+
+watch(range, loadWorkers)
 
 /* ---------- 渲染辅助 ---------- */
 
@@ -342,6 +378,97 @@ const countryOption = computed(() => {
     ],
   }
 })
+
+const workerByDay = computed(() => {
+  const map = new Map<string, { label: string; requests: number; errors: number }>()
+  for (const r of workerRows.value) {
+    const cur = map.get(r.label) ?? { label: r.label, requests: 0, errors: 0 }
+    cur.requests += r.requests
+    cur.errors += r.errors
+    map.set(r.label, cur)
+  }
+  return [...map.values()]
+})
+
+const workerByScript = computed(() => {
+  const map = new Map<string, { script: string; requests: number; errors: number }>()
+  for (const r of workerRows.value) {
+    const cur = map.get(r.script) ?? { script: r.script, requests: 0, errors: 0 }
+    cur.requests += r.requests
+    cur.errors += r.errors
+    map.set(r.script, cur)
+  }
+  return [...map.values()].sort((a, b) => b.requests - a.requests).slice(0, 8)
+})
+
+const workerTrendOption = computed(() => {
+  void themeVersion.value
+  const colorPrimary = cssVar('--chart-1', '#5b8ff9')
+  const colorErr = cssVar('--chart-2', '#f59e0b')
+  const colorMuted = cssVar('--muted-foreground', '#999')
+  const colorBorder = cssVar('--border', '#eee')
+  const days = workerByDay.value
+  return {
+    animation: false,
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: cssVar('--popover', '#fff'),
+      borderColor: colorBorder,
+      textStyle: { color: cssVar('--popover-foreground', '#333'), fontSize: 12 },
+      axisPointer: { type: 'line', triggerEmphasis: false },
+      formatter: (params: Array<{ dataIndex: number }>) => {
+        const p = days[params[0]?.dataIndex ?? -1]
+        if (!p) return ''
+        return `<div style="font-weight:600">${p.label}</div>
+          <div>调用 ${fmtNum(p.requests)}</div>
+          <div>错误 ${fmtNum(p.errors)}</div>`
+      },
+    },
+    legend: {
+      data: ['调用', '错误'],
+      textStyle: { color: colorMuted, fontSize: 11 },
+      top: 0,
+    },
+    grid: { left: 48, right: 16, top: 28, bottom: 28 },
+    xAxis: {
+      type: 'category',
+      data: days.map((p) => p.label),
+      boundaryGap: false,
+      axisLine: { lineStyle: { color: colorBorder } },
+      axisLabel: { color: colorMuted, fontSize: 11, hideOverlap: true },
+      axisTick: { show: false },
+    },
+    yAxis: {
+      type: 'value',
+      axisLabel: { color: colorMuted, fontSize: 11, formatter: (v: number) => fmtAxis(v) },
+      splitLine: { lineStyle: { color: colorBorder, type: 'dashed' } },
+      axisLine: { show: false },
+      axisTick: { show: false },
+    },
+    series: [
+      {
+        name: '调用',
+        type: 'line',
+        smooth: true,
+        showSymbol: false,
+        data: days.map((p) => p.requests),
+        lineStyle: { color: colorPrimary, width: 2 },
+        itemStyle: { color: colorPrimary },
+        emphasis: { disabled: true },
+      },
+      {
+        name: '错误',
+        type: 'line',
+        smooth: true,
+        showSymbol: false,
+        data: days.map((p) => p.errors),
+        lineStyle: { color: colorErr, width: 2 },
+        itemStyle: { color: colorErr },
+        emphasis: { disabled: true },
+      },
+    ],
+  }
+})
 </script>
 
 <template>
@@ -355,7 +482,7 @@ const countryOption = computed(() => {
         <div>
           <h2 class="text-lg font-semibold tracking-tight">分析统计</h2>
           <p class="text-sm text-muted-foreground">
-            Cloudflare GraphQL Analytics · 基于 zone 维度的 HTTP 请求分析
+            Cloudflare GraphQL Analytics · zone HTTP 请求 + 账号 Workers 调用
           </p>
         </div>
       </div>
@@ -386,9 +513,9 @@ const countryOption = computed(() => {
         <Button
           variant="ghost"
           size="sm"
-          :disabled="loading || !selectedZoneId"
+          :disabled="loading || workerLoading"
           class="ml-auto"
-          @click="loadAnalytics"
+          @click="() => { loadAnalytics(); loadWorkers() }"
         >
           <RefreshCw class="size-4" :class="{ 'animate-spin': loading }" />
           刷新
@@ -533,5 +660,59 @@ const countryOption = computed(() => {
         </CardContent>
       </Card>
     </template>
+
+    <!-- Workers 调用（account 维度，不依赖 zone） -->
+    <Card>
+      <CardHeader class="pb-2">
+        <div class="flex items-center justify-between gap-2">
+          <CardTitle class="flex items-center gap-2 text-base">
+            <Server class="size-4 text-primary" />
+            Workers 调用
+          </CardTitle>
+          <Badge variant="secondary">
+            {{ fmtNum(workerTotal) }} 次 · {{ workerByScript.length }} 个脚本
+          </Badge>
+        </div>
+        <p class="text-xs text-muted-foreground">账号维度 GraphQL workersInvocationsAdaptive，与上方域名选择无关</p>
+      </CardHeader>
+      <CardContent class="space-y-4">
+        <div v-if="workerError" class="text-sm text-destructive">
+          {{ workerError }}
+          <p class="mt-1 text-xs text-muted-foreground">API Token 需包含 Account Analytics 读权限。</p>
+        </div>
+        <VChart
+          v-else-if="workerByDay.length"
+          class="w-full"
+          style="height: 240px"
+          :option="workerTrendOption"
+          autoresize
+        />
+        <div v-else-if="workerLoading" class="flex h-60 items-end gap-1">
+          <Skeleton v-for="i in 16" :key="i" class="flex-1" :style="{ height: `${20 + ((i * 11) % 60)}%` }" />
+        </div>
+        <div v-else class="flex h-40 flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
+          <Server class="size-8 opacity-40" />
+          <p>该时间范围内没有 Workers 调用</p>
+        </div>
+        <div v-if="workerByScript.length" class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="border-b text-left text-xs text-muted-foreground">
+                <th class="px-2 py-1.5 font-medium">脚本</th>
+                <th class="px-2 py-1.5 text-right font-medium">调用</th>
+                <th class="px-2 py-1.5 text-right font-medium">错误</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="s in workerByScript" :key="s.script" class="border-b last:border-0">
+                <td class="truncate px-2 py-1.5 font-mono text-xs">{{ s.script }}</td>
+                <td class="px-2 py-1.5 text-right tabular-nums">{{ fmtNum(s.requests) }}</td>
+                <td class="px-2 py-1.5 text-right tabular-nums">{{ fmtNum(s.errors) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
   </div>
 </template>
