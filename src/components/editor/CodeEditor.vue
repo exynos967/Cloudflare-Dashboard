@@ -26,14 +26,14 @@ const extensions = computed(() => {
 </script>
 
 <template>
-  <div class="overflow-hidden rounded-md border" :class="disabled ? 'pointer-events-none opacity-60' : ''">
+  <div class="h-full overflow-hidden rounded-md border" :class="disabled ? 'pointer-events-none opacity-60' : ''" :style="{ height }">
     <Codemirror
       :model-value="modelValue"
       :disabled="disabled"
       :extensions="extensions"
       :indent-with-tab="true"
       :tab-size="2"
-      :style="{ height }"
+      style="height: 100%"
       @update:model-value="(v: string) => emit('update:modelValue', v)"
     />
   </div>

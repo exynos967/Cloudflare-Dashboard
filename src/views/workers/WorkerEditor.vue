@@ -448,14 +448,14 @@ async function confirmDeleteSecret() {
 
 <template>
   <Sheet :open="open" @update:open="(v) => emit('update:open', v)">
-    <SheetContent side="right" class="flex w-full flex-col gap-0 sm:max-w-3xl">
-      <SheetHeader class="border-b px-6 py-4">
+    <SheetContent side="right" class="flex w-full flex-col gap-0 overflow-hidden sm:max-w-3xl">
+      <SheetHeader class="shrink-0 border-b px-6 py-4">
         <SheetTitle class="truncate font-mono">{{ name }}</SheetTitle>
         <SheetDescription>编辑脚本代码、路由、自定义域、workers.dev 与绑定/定时/密钥</SheetDescription>
       </SheetHeader>
 
-      <div class="flex-1 overflow-y-auto px-6 py-4">
-        <Tabs default-value="code" class="w-full">
+      <Tabs default-value="code" class="flex min-h-0 flex-1 flex-col gap-0">
+        <div class="shrink-0 px-6 pt-4">
           <TabsList class="grid w-full grid-cols-5">
             <TabsTrigger value="code">代码</TabsTrigger>
             <TabsTrigger value="routes">路由</TabsTrigger>
@@ -463,9 +463,11 @@ async function confirmDeleteSecret() {
             <TabsTrigger value="workersdev">workers.dev</TabsTrigger>
             <TabsTrigger value="config">配置</TabsTrigger>
           </TabsList>
+        </div>
 
           <!-- 代码 -->
-          <TabsContent value="code" class="space-y-3">
+          <TabsContent value="code" class="mt-0 flex min-h-0 flex-1 flex-col overflow-hidden px-6 py-4">
+            <div class="shrink-0 space-y-3">
             <div class="flex items-center justify-between">
               <p class="text-sm text-muted-foreground">修改后点击保存即立即重新部署</p>
               <Button size="sm" :disabled="saving || codeLoading || !codeLoaded" @click="saveCode">
@@ -504,18 +506,17 @@ async function confirmDeleteSecret() {
               </div>
             </div>
             <Separator />
-            <div v-if="codeLoading" class="space-y-2">
+            </div>
+            <div v-if="codeLoading" class="min-h-0 flex-1 space-y-2 overflow-hidden pt-3">
               <Skeleton class="h-6 w-full" v-for="i in 8" :key="i" />
             </div>
-            <CodeEditor
-              v-else
-              v-model="code"
-              height="60vh"
-            />
+            <div v-else class="min-h-0 flex-1 pt-3">
+              <CodeEditor v-model="code" height="100%" />
+            </div>
           </TabsContent>
 
           <!-- 路由 -->
-          <TabsContent value="routes" class="space-y-4">
+          <TabsContent value="routes" class="mt-0 min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-4">
             <div class="space-y-1.5">
               <Label>选择域名（Zone）</Label>
               <Select v-model="selectedZoneId">
@@ -574,7 +575,7 @@ async function confirmDeleteSecret() {
           </TabsContent>
 
           <!-- 自定义域 -->
-          <TabsContent value="domains" class="space-y-4">
+          <TabsContent value="domains" class="mt-0 min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-4">
             <div class="space-y-2">
               <Label>添加自定义域</Label>
               <div class="grid gap-2 sm:grid-cols-[1fr_1.5fr_auto]">
@@ -627,7 +628,7 @@ async function confirmDeleteSecret() {
           </TabsContent>
 
           <!-- workers.dev -->
-          <TabsContent value="workersdev" class="space-y-4">
+          <TabsContent value="workersdev" class="mt-0 min-h-0 flex-1 space-y-4 overflow-y-auto px-6 py-4">
             <div v-if="subdomainLoading" class="flex items-center gap-2 text-sm text-muted-foreground">
               <Loader2 class="size-4 animate-spin" /> 加载中…
             </div>
@@ -672,7 +673,7 @@ async function confirmDeleteSecret() {
           </TabsContent>
 
           <!-- 配置：bindings 只读 / cron / secrets -->
-          <TabsContent value="config" class="space-y-6">
+          <TabsContent value="config" class="mt-0 min-h-0 flex-1 space-y-6 overflow-y-auto px-6 py-4">
             <div v-if="configLoading" class="space-y-2">
               <Skeleton v-for="i in 5" :key="i" class="h-10 w-full" />
             </div>
@@ -779,10 +780,9 @@ async function confirmDeleteSecret() {
             </template>
           </TabsContent>
         </Tabs>
-      </div>
 
       <!-- 底部 -->
-      <div class="flex items-center justify-end gap-2 border-t px-6 py-3">
+      <div class="flex shrink-0 items-center justify-end gap-2 border-t px-6 py-3">
         <Button variant="destructive" size="sm" @click="deleteOpen = true">
           <Trash2 class="size-4" />
           删除此 Worker
