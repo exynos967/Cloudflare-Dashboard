@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { toast } from 'vue-sonner'
-import { RefreshCw, Loader2, ShieldAlert, Globe, Plus, Trash2, Flame, Layers, ExternalLink } from '@lucide/vue'
+import { RefreshCw, Loader2, ShieldAlert, Globe, Plus, Trash2, Flame, Layers } from '@lucide/vue'
 import { securityApi } from '@/api'
 import type {
   CertificatePack,
   CertificatePackCert,
   FirewallAccessRule,
+  FirewallRulePayload,
   RulesetRule,
   PageRule,
   PageRuleAction,
@@ -16,6 +17,8 @@ import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
+import { Switch } from '@/components/ui/switch'
 import {
   Card,
   CardContent,
@@ -105,7 +108,8 @@ async function loadWafRules() {
   wafRulesError.value = ''
   wafRules.value = []
   try {
-    wafRules.value = await securityApi.listFirewallRules(props.zoneId)
+    const snap = await securityApi.listFirewallRules(props.zoneId)
+    wafRules.value = snap.rules
   } catch (e) {
     wafRulesError.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -129,6 +133,137 @@ function wafActionClass(a: string): string {
   return 'bg-muted text-muted-foreground'
 }
 
+interface WafTemplate {
+  id: string
+  label: string
+  expression: string
+  action: FirewallRulePayload['action']
+  description: string
+}
+
+/** 常用模板：表达式字段用官方 ip.src.country，不用已弃用的 ip.geoip.* */
+const WAF_TEMPLATES: WafTemplate[] = [
+  {
+    id: 'non_cn',
+    label: '拦截非中国流量',
+    expression: '(not ip.src.country in {"CN"})',
+    action: 'block',
+    description: '拦截非中国流量',
+  },
+  {
+    id: 'non_get',
+    label: '拦截非 GET/HEAD',
+    expression: '(not http.request.method in {"GET" "HEAD"})',
+    action: 'block',
+    description: '拦截非 GET/HEAD 请求',
+  },
+  {
+    id: 'has_query',
+    label: '拦截带查询参数',
+    expression: '(http.request.uri.query ne "")',
+    action: 'block',
+    description: '拦截带查询参数的请求',
+  },
+  {
+    id: 'empty_ua',
+    label: '拦截空 User-Agent',
+    expression: '(http.user_agent eq "")',
+    action: 'block',
+    description: '拦截空 User-Agent',
+  },
+  {
+    id: 'custom',
+    label: '自定义表达式',
+    expression: '',
+    action: 'block',
+    description: '',
+  },
+]
+
+const WAF_CREATE_ACTIONS = ['block', 'managed_challenge', 'js_challenge', 'challenge', 'log', 'skip'] as const
+
+const addWafOpen = ref(false)
+const creatingWaf = ref(false)
+const wafForm = ref({
+  template: 'non_cn',
+  expression: WAF_TEMPLATES[0].expression,
+  action: 'block' as string,
+  description: WAF_TEMPLATES[0].description,
+})
+
+function openAddWaf() {
+  const t = WAF_TEMPLATES[0]
+  wafForm.value = { template: t.id, expression: t.expression, action: t.action, description: t.description }
+  addWafOpen.value = true
+}
+
+function applyWafTemplate(id: string) {
+  const t = WAF_TEMPLATES.find((x) => x.id === id) ?? WAF_TEMPLATES[0]
+  wafForm.value.template = t.id
+  wafForm.value.expression = t.expression
+  wafForm.value.action = t.action
+  wafForm.value.description = t.description
+}
+
+async function submitAddWaf() {
+  if (!props.zoneId) return
+  const expression = wafForm.value.expression.trim()
+  if (!expression) {
+    toast.error('请填写匹配表达式')
+    return
+  }
+  creatingWaf.value = true
+  try {
+    await securityApi.createFirewallRule(props.zoneId, {
+      action: wafForm.value.action,
+      expression,
+      description: wafForm.value.description.trim() || undefined,
+      enabled: true,
+    })
+    toast.success('WAF 规则已创建')
+    addWafOpen.value = false
+    await loadWafRules()
+  } catch (e) {
+    toast.error('创建失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    creatingWaf.value = false
+  }
+}
+
+const wafToggling = ref<string | null>(null)
+
+async function toggleWafEnabled(rule: RulesetRule, enabled: boolean) {
+  if (!props.zoneId || wafToggling.value) return
+  wafToggling.value = rule.id
+  try {
+    await securityApi.setFirewallRuleEnabled(props.zoneId, rule, enabled)
+    rule.enabled = enabled
+    toast.success(enabled ? '已启用' : '已禁用')
+  } catch (e) {
+    toast.error('切换失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    wafToggling.value = null
+  }
+}
+
+const deleteWafTarget = ref<RulesetRule | null>(null)
+const deletingWaf = ref(false)
+
+async function confirmDeleteWaf() {
+  if (!deleteWafTarget.value || !props.zoneId) return
+  deletingWaf.value = true
+  try {
+    await securityApi.deleteFirewallRule(props.zoneId, deleteWafTarget.value.id)
+    toast.success('已删除')
+    deleteWafTarget.value = null
+    await loadWafRules()
+  } catch (e) {
+    toast.error('删除失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    deletingWaf.value = false
+  }
+}
+
 /* ----------------------------- 缓存规则（zone 维度） ----------------------------- */
 
 const cacheRules = ref<RulesetRule[]>([])
@@ -141,11 +276,65 @@ async function loadCacheRules() {
   cacheRulesError.value = ''
   cacheRules.value = []
   try {
-    cacheRules.value = await securityApi.listCacheRules(props.zoneId)
+    const snap = await securityApi.listCacheRules(props.zoneId)
+    cacheRules.value = snap.rules
   } catch (e) {
     cacheRulesError.value = e instanceof Error ? e.message : String(e)
   } finally {
     cacheRulesLoading.value = false
+  }
+}
+
+const addCacheOpen = ref(false)
+const creatingCache = ref(false)
+const cacheForm = ref({
+  expression: 'true',
+  description: '缓存所有内容',
+})
+
+function openAddCache() {
+  cacheForm.value = { expression: 'true', description: '缓存所有内容' }
+  addCacheOpen.value = true
+}
+
+async function submitAddCache() {
+  if (!props.zoneId) return
+  const expression = cacheForm.value.expression.trim()
+  if (!expression) {
+    toast.error('请填写匹配表达式')
+    return
+  }
+  creatingCache.value = true
+  try {
+    await securityApi.createCacheRule(props.zoneId, {
+      expression,
+      description: cacheForm.value.description.trim() || undefined,
+    })
+    toast.success('缓存规则已创建')
+    addCacheOpen.value = false
+    await loadCacheRules()
+  } catch (e) {
+    toast.error('创建失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    creatingCache.value = false
+  }
+}
+
+const deleteCacheTarget = ref<RulesetRule | null>(null)
+const deletingCache = ref(false)
+
+async function confirmDeleteCache() {
+  if (!deleteCacheTarget.value || !props.zoneId) return
+  deletingCache.value = true
+  try {
+    await securityApi.deleteCacheRule(props.zoneId, deleteCacheTarget.value.id)
+    toast.success('已删除')
+    deleteCacheTarget.value = null
+    await loadCacheRules()
+  } catch (e) {
+    toast.error('删除失败', { description: e instanceof Error ? e.message : String(e) })
+  } finally {
+    deletingCache.value = false
   }
 }
 
@@ -644,17 +833,13 @@ onMounted(() => {
             <ShieldAlert class="size-4 text-primary" />
             WAF 自定义规则
           </CardTitle>
-          <CardDescription>按表达式匹配请求并阻止、质询或放行，此处仅展示，编辑请前往 Cloudflare 仪表板</CardDescription>
+          <CardDescription>
+            按表达式匹配请求并阻止、质询或跳过。追加走 Rulesets POST，不会整表覆盖。免费档通常最多 5 条。
+          </CardDescription>
         </div>
-        <Button
-          size="sm"
-          variant="outline"
-          as="a"
-          href="https://dash.cloudflare.com/?to=/:account/:zone/security/waf/custom-rules"
-          target="_blank"
-        >
-          <ExternalLink class="size-4" />
-          去 Cloudflare 仪表板修改
+        <Button size="sm" @click="openAddWaf">
+          <Plus class="size-4" />
+          添加规则
         </Button>
       </CardHeader>
       <CardContent class="p-0">
@@ -680,29 +865,43 @@ onMounted(() => {
             <ShieldAlert class="size-6 text-muted-foreground" />
           </div>
           <div class="text-sm text-muted-foreground">暂无 WAF 自定义规则</div>
+          <Button size="sm" @click="openAddWaf">
+            <Plus class="size-4" />
+            添加第一条
+          </Button>
         </div>
         <template v-else>
-          <div class="grid grid-cols-[minmax(160px,2fr)_minmax(200px,3fr)_110px_90px] gap-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
+          <div class="grid grid-cols-[minmax(140px,1.6fr)_minmax(180px,2.4fr)_100px_70px_72px] gap-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
             <span>描述</span>
             <span>表达式</span>
             <span>动作</span>
-            <span>状态</span>
+            <span>启用</span>
+            <span class="text-right">操作</span>
           </div>
           <div class="divide-y">
             <div
               v-for="r in wafRules"
               :key="r.id"
-              class="grid grid-cols-[minmax(160px,2fr)_minmax(200px,3fr)_110px_90px] items-center gap-2 px-4 py-3 text-sm hover:bg-accent/40"
+              class="grid grid-cols-[minmax(140px,1.6fr)_minmax(180px,2.4fr)_100px_70px_72px] items-center gap-2 px-4 py-3 text-sm hover:bg-accent/40"
             >
               <span class="truncate font-medium" :title="r.description">{{ r.description || '—' }}</span>
               <code class="truncate font-mono text-xs text-muted-foreground" :title="r.expression">{{ r.expression }}</code>
               <Badge variant="secondary" :class="wafActionClass(r.action)">{{ WAF_ACTION_LABEL[r.action] ?? r.action }}</Badge>
-              <Badge
-                variant="secondary"
-                :class="r.enabled ? 'bg-emerald-500/15 text-emerald-600' : 'bg-muted text-muted-foreground'"
-              >
-                {{ r.enabled ? '启用' : '禁用' }}
-              </Badge>
+              <Switch
+                :model-value="r.enabled"
+                :disabled="wafToggling === r.id"
+                @update:model-value="(v: boolean) => toggleWafEnabled(r, v)"
+              />
+              <div class="flex justify-end">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  class="text-muted-foreground hover:text-destructive"
+                  @click="deleteWafTarget = r"
+                >
+                  <Trash2 class="size-3.5" />
+                </Button>
+              </div>
             </div>
           </div>
         </template>
@@ -717,17 +916,11 @@ onMounted(() => {
             <Layers class="size-4 text-primary" />
             缓存规则
           </CardTitle>
-          <CardDescription>按表达式定制缓存行为（TTL、绕过等），此处仅展示，编辑请前往 Cloudflare 仪表板</CardDescription>
+          <CardDescription>按表达式启用边缘缓存。此处创建的规则动作为「缓存匹配请求」，复杂 TTL 仍可去官方后台改。</CardDescription>
         </div>
-        <Button
-          size="sm"
-          variant="outline"
-          as="a"
-          href="https://dash.cloudflare.com/?to=/:account/:zone/caching/cache-rules"
-          target="_blank"
-        >
-          <ExternalLink class="size-4" />
-          去 Cloudflare 仪表板修改
+        <Button size="sm" @click="openAddCache">
+          <Plus class="size-4" />
+          添加规则
         </Button>
       </CardHeader>
       <CardContent class="p-0">
@@ -753,29 +946,37 @@ onMounted(() => {
             <Layers class="size-6 text-muted-foreground" />
           </div>
           <div class="text-sm text-muted-foreground">暂无缓存规则</div>
+          <Button size="sm" @click="openAddCache">
+            <Plus class="size-4" />
+            缓存所有内容
+          </Button>
         </div>
         <template v-else>
-          <div class="grid grid-cols-[minmax(160px,2fr)_minmax(200px,3fr)_140px_90px] gap-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
+          <div class="grid grid-cols-[minmax(140px,1.6fr)_minmax(180px,2.4fr)_140px_72px] gap-2 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
             <span>描述</span>
             <span>表达式</span>
             <span>动作</span>
-            <span>状态</span>
+            <span class="text-right">操作</span>
           </div>
           <div class="divide-y">
             <div
               v-for="r in cacheRules"
               :key="r.id"
-              class="grid grid-cols-[minmax(160px,2fr)_minmax(200px,3fr)_140px_90px] items-center gap-2 px-4 py-3 text-sm hover:bg-accent/40"
+              class="grid grid-cols-[minmax(140px,1.6fr)_minmax(180px,2.4fr)_140px_72px] items-center gap-2 px-4 py-3 text-sm hover:bg-accent/40"
             >
               <span class="truncate font-medium" :title="r.description">{{ r.description || '—' }}</span>
               <code class="truncate font-mono text-xs text-muted-foreground" :title="r.expression">{{ r.expression }}</code>
               <code class="truncate text-xs text-muted-foreground" :title="r.action">{{ r.action }}</code>
-              <Badge
-                variant="secondary"
-                :class="r.enabled ? 'bg-emerald-500/15 text-emerald-600' : 'bg-muted text-muted-foreground'"
-              >
-                {{ r.enabled ? '启用' : '禁用' }}
-              </Badge>
+              <div class="flex justify-end">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  class="text-muted-foreground hover:text-destructive"
+                  @click="deleteCacheTarget = r"
+                >
+                  <Trash2 class="size-3.5" />
+                </Button>
+              </div>
             </div>
           </div>
         </template>
@@ -947,6 +1148,110 @@ onMounted(() => {
         </template>
       </CardContent>
     </Card>
+
+    <!-- 添加 WAF 自定义规则 -->
+    <Dialog v-model:open="addWafOpen">
+      <DialogContent class="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>添加 WAF 自定义规则</DialogTitle>
+          <DialogDescription>选用模板或填写 Cloudflare 规则语言表达式。创建为追加，不会覆盖既有规则。</DialogDescription>
+        </DialogHeader>
+        <div class="space-y-4">
+          <div class="space-y-2">
+            <Label>模板</Label>
+            <Select :model-value="wafForm.template" @update:model-value="(v) => applyWafTemplate(String(v))">
+              <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem v-for="t in WAF_TEMPLATES" :key="t.id" :value="t.id">{{ t.label }}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div class="space-y-2">
+            <Label>动作</Label>
+            <Select v-model="wafForm.action">
+              <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem v-for="a in WAF_CREATE_ACTIONS" :key="a" :value="a">{{ WAF_ACTION_LABEL[a] }}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div class="space-y-2">
+            <Label>描述</Label>
+            <Input v-model="wafForm.description" placeholder="规则用途说明" />
+          </div>
+          <div class="space-y-2">
+            <Label>表达式</Label>
+            <Textarea v-model="wafForm.expression" class="min-h-24 font-mono text-xs" spellcheck="false" />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" @click="addWafOpen = false">取消</Button>
+          <Button :disabled="creatingWaf" @click="submitAddWaf">
+            <Loader2 v-if="creatingWaf" class="size-4 animate-spin" />
+            {{ creatingWaf ? '创建中…' : '创建' }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog :open="!!deleteWafTarget" @update:open="(v) => !v && (deleteWafTarget = null)">
+      <DialogContent class="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>删除 WAF 规则</DialogTitle>
+          <DialogDescription>
+            确定删除规则 <span class="font-medium text-foreground">{{ deleteWafTarget?.description || deleteWafTarget?.id }}</span>？
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" @click="deleteWafTarget = null">取消</Button>
+          <Button variant="destructive" :disabled="deletingWaf" @click="confirmDeleteWaf">
+            {{ deletingWaf ? '删除中…' : '确认删除' }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog v-model:open="addCacheOpen">
+      <DialogContent class="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>添加缓存规则</DialogTitle>
+          <DialogDescription>匹配表达式的请求将启用边缘缓存。默认 <code class="font-mono">true</code> 表示全部请求。</DialogDescription>
+        </DialogHeader>
+        <div class="space-y-4">
+          <div class="space-y-2">
+            <Label>描述</Label>
+            <Input v-model="cacheForm.description" placeholder="如 缓存所有内容" />
+          </div>
+          <div class="space-y-2">
+            <Label>表达式</Label>
+            <Textarea v-model="cacheForm.expression" class="min-h-20 font-mono text-xs" spellcheck="false" />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" @click="addCacheOpen = false">取消</Button>
+          <Button :disabled="creatingCache" @click="submitAddCache">
+            {{ creatingCache ? '创建中…' : '创建' }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog :open="!!deleteCacheTarget" @update:open="(v) => !v && (deleteCacheTarget = null)">
+      <DialogContent class="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>删除缓存规则</DialogTitle>
+          <DialogDescription>
+            确定删除规则 <span class="font-medium text-foreground">{{ deleteCacheTarget?.description || deleteCacheTarget?.id }}</span>？
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" @click="deleteCacheTarget = null">取消</Button>
+          <Button variant="destructive" :disabled="deletingCache" @click="confirmDeleteCache">
+            {{ deletingCache ? '删除中…' : '确认删除' }}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
 
     <!-- 添加访问规则 -->
     <Dialog v-model:open="addOpen">

@@ -67,12 +67,27 @@ export interface RulesetRule {
   action: string
   enabled: boolean
   last_updated?: string
+  action_parameters?: Record<string, unknown>
 }
 
-/** Rulesets API：phase entrypoint 规则集（只取 rules，其余字段按需扩展） */
+/** Rulesets API：phase entrypoint 规则集 */
 interface RulesetEntrypoint {
   id: string
   rules?: RulesetRule[]
+}
+
+/** 列出某 phase 规则时带上 ruleset id，后续追加/删除必须走该 id，禁止无读全量 PUT */
+export interface RulesetPhaseSnapshot {
+  rulesetId: string
+  rules: RulesetRule[]
+}
+
+/** 创建 WAF 自定义规则的入参 */
+export interface FirewallRulePayload {
+  action: string
+  expression: string
+  description?: string
+  enabled?: boolean
 }
 
 /** Page Rule 目标 */
@@ -109,19 +124,80 @@ function accountId(): string {
 }
 
 /**
- * 读取某 phase 的 entrypoint 规则集内的规则。
- * zone 从未创建过该 phase entrypoint 时 CF 返回 404，视为空列表；其他错误上抛。
+ * 读取某 phase 的 entrypoint 规则集。
+ * zone 从未创建过该 phase entrypoint 时 CF 返回 404，视为空；其他错误上抛。
  */
-async function listPhaseRules(zoneId: string, phase: string): Promise<RulesetRule[]> {
+async function getPhaseEntrypoint(zoneId: string, phase: string): Promise<RulesetEntrypoint | null> {
   try {
-    const ruleset = await http.get<RulesetEntrypoint>(
+    return await http.get<RulesetEntrypoint>(
       `/zones/${zoneId}/rulesets/phases/${phase}/entrypoint`,
     )
-    return ruleset.rules ?? []
   } catch (e) {
-    if (e instanceof CFError && e.status === 404) return []
+    if (e instanceof CFError && e.status === 404) return null
     throw e
   }
+}
+
+async function getPhaseSnapshot(zoneId: string, phase: string): Promise<RulesetPhaseSnapshot> {
+  const ruleset = await getPhaseEntrypoint(zoneId, phase)
+  return { rulesetId: ruleset?.id ?? '', rules: ruleset?.rules ?? [] }
+}
+
+/**
+ * 确保 phase entrypoint 存在并返回 ruleset id。
+ * 没有则 POST 一个空规则集；追加规则一律走 POST .../rules，避免 PUT 整表覆盖。
+ */
+async function ensurePhaseEntrypoint(zoneId: string, phase: string, name: string): Promise<string> {
+  const existing = await getPhaseEntrypoint(zoneId, phase)
+  if (existing?.id) return existing.id
+  const created = await http.post<RulesetEntrypoint>(`/zones/${zoneId}/rulesets`, {
+    body: { name, kind: 'zone', phase, rules: [] },
+  })
+  if (!created.id) throw new CFError('创建规则集失败：响应缺少 id')
+  return created.id
+}
+
+async function addPhaseRule(
+  zoneId: string,
+  phase: string,
+  name: string,
+  rule: FirewallRulePayload & { action_parameters?: Record<string, unknown> },
+): Promise<void> {
+  const rulesetId = await ensurePhaseEntrypoint(zoneId, phase, name)
+  await http.post<RulesetEntrypoint>(`/zones/${zoneId}/rulesets/${rulesetId}/rules`, {
+    body: {
+      action: rule.action,
+      expression: rule.expression,
+      description: rule.description ?? '',
+      enabled: rule.enabled ?? true,
+      ...(rule.action_parameters ? { action_parameters: rule.action_parameters } : {}),
+    },
+  })
+}
+
+async function deletePhaseRule(zoneId: string, phase: string, ruleId: string): Promise<void> {
+  const ruleset = await getPhaseEntrypoint(zoneId, phase)
+  if (!ruleset?.id) throw new CFError('规则集不存在，无法删除')
+  await http.delete<unknown>(`/zones/${zoneId}/rulesets/${ruleset.id}/rules/${ruleId}`)
+}
+
+async function patchPhaseRule(
+  zoneId: string,
+  phase: string,
+  rule: RulesetRule,
+  patch: Partial<Pick<RulesetRule, 'enabled' | 'action' | 'expression' | 'description'>>,
+): Promise<void> {
+  const ruleset = await getPhaseEntrypoint(zoneId, phase)
+  if (!ruleset?.id) throw new CFError('规则集不存在，无法更新')
+  await http.patch<RulesetEntrypoint>(`/zones/${zoneId}/rulesets/${ruleset.id}/rules/${rule.id}`, {
+    body: {
+      action: patch.action ?? rule.action,
+      expression: patch.expression ?? rule.expression,
+      description: patch.description ?? rule.description ?? '',
+      enabled: patch.enabled ?? rule.enabled,
+      ...(rule.action_parameters ? { action_parameters: rule.action_parameters } : {}),
+    },
+  })
 }
 
 export const securityApi = {
@@ -173,7 +249,20 @@ export const securityApi = {
 
   /** WAF 自定义规则（Rulesets API；旧 Firewall Rules API 已于 2025-06-15 停服） */
   listFirewallRules: (zoneId: string) =>
-    listPhaseRules(zoneId, 'http_request_firewall_custom'),
+    getPhaseSnapshot(zoneId, 'http_request_firewall_custom'),
+
+  createFirewallRule: (zoneId: string, data: FirewallRulePayload) =>
+    addPhaseRule(zoneId, 'http_request_firewall_custom', 'Custom rules', {
+      ...data,
+      // skip 必须带 action_parameters，否则 CF 会 400
+      ...(data.action === 'skip' ? { action_parameters: { ruleset: 'current' } } : {}),
+    }),
+
+  deleteFirewallRule: (zoneId: string, ruleId: string) =>
+    deletePhaseRule(zoneId, 'http_request_firewall_custom', ruleId),
+
+  setFirewallRuleEnabled: (zoneId: string, rule: RulesetRule, enabled: boolean) =>
+    patchPhaseRule(zoneId, 'http_request_firewall_custom', rule, { enabled }),
 
   /* ------------------------------ 缓存规则 ------------------------------ */
 
@@ -195,7 +284,19 @@ export const securityApi = {
 
   /** 缓存规则（Rulesets API http_request_cache_settings phase） */
   listCacheRules: (zoneId: string) =>
-    listPhaseRules(zoneId, 'http_request_cache_settings'),
+    getPhaseSnapshot(zoneId, 'http_request_cache_settings'),
+
+  createCacheRule: (zoneId: string, data: { expression: string; description?: string; enabled?: boolean }) =>
+    addPhaseRule(zoneId, 'http_request_cache_settings', 'Cache rules', {
+      action: 'set_cache_settings',
+      expression: data.expression,
+      description: data.description,
+      enabled: data.enabled,
+      action_parameters: { cache: true },
+    }),
+
+  deleteCacheRule: (zoneId: string, ruleId: string) =>
+    deletePhaseRule(zoneId, 'http_request_cache_settings', ruleId),
 }
 
 /* -------------------------------------------------------------------------- */
@@ -271,6 +372,9 @@ export const SETTING_DEFS: SettingDef[] = [
   },
   { id: 'browser_check', label: '浏览器完整性检查', type: 'onoff', group: 'security' },
   { id: 'hotlink_protection', label: '防盗链保护', type: 'onoff', group: 'security' },
+  { id: 'email_obfuscation', label: '邮箱地址混淆', type: 'onoff', group: 'security' },
+  { id: 'server_side_exclude', label: '服务器端排除', type: 'onoff', group: 'security' },
+  { id: 'ip_geolocation', label: 'IP 地理定位头', type: 'onoff', group: 'security' },
 
   /* 缓存 */
   {
@@ -296,12 +400,27 @@ export const SETTING_DEFS: SettingDef[] = [
     requiresPro: true,
     group: 'cache',
   },
+  { id: 'always_online', label: 'Always Online', type: 'onoff', group: 'cache' },
+  { id: 'sort_query_string_for_cache', label: '查询字符串排序缓存', type: 'onoff', group: 'cache' },
+  { id: 'webp', label: 'WebP 转换', type: 'onoff', requiresPro: true, group: 'cache' },
 
   /* 速度 */
   { id: 'brotli', label: 'Brotli 压缩', type: 'onoff', group: 'speed' },
   { id: 'early_hints', label: 'Early Hints', type: 'onoff', group: 'speed' },
+  { id: 'http2', label: 'HTTP/2', type: 'onoff', group: 'speed' },
   { id: 'http3', label: 'HTTP/3 (QUIC)', type: 'onoff', group: 'speed' },
   { id: '0rtt', label: '0-RTT 连接恢复', type: 'onoff', group: 'speed' },
+  {
+    id: 'rocket_loader',
+    label: 'Rocket Loader',
+    type: 'select',
+    options: ['off', 'on'],
+    group: 'speed',
+  },
+  { id: 'websockets', label: 'WebSockets', type: 'onoff', group: 'speed' },
+  { id: 'ipv6', label: 'IPv6', type: 'onoff', group: 'speed' },
+  { id: 'prefetch_preload', label: 'Prefetch 预加载', type: 'onoff', group: 'speed' },
+  { id: 'opportunistic_onion', label: '洋葱路由机会性加密', type: 'onoff', group: 'speed' },
 ]
 
 /** 单个配置项的值（on/off 字符串、枚举或数字） */
@@ -334,6 +453,7 @@ export const OPTION_LABELS: Record<string, Record<string, string>> = {
   polish: { off: '关闭', lossless: '无损', lossy: '有损' },
   tls_1_3: { on: '开启', off: '关闭', zrt: '零往返时间恢复 (0-RTT)' },
   min_tls_version: { '1.0': 'TLS 1.0', '1.1': 'TLS 1.1', '1.2': 'TLS 1.2', '1.3': 'TLS 1.3' },
+  rocket_loader: { off: '关闭', on: '开启' },
 }
 
 /** 取某 select 项某值的中文文案，无映射回退原值 */
