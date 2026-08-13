@@ -89,8 +89,12 @@ async function loadRules() {
   try {
     rules.value = await emailApi.listRules(props.zoneId)
   } catch (e) {
-    rulesError.value = e instanceof Error ? e.message : String(e)
-    rules.value = []
+    if (e instanceof CFError && e.status === 404) {
+      rules.value = []
+    } else {
+      rulesError.value = e instanceof Error ? e.message : String(e)
+      rules.value = []
+    }
   } finally {
     rulesLoading.value = false
   }
@@ -117,6 +121,11 @@ watch(() => props.zoneId, reload)
 onMounted(reload)
 
 const enabled = computed(() => !!settings.value?.enabled)
+const canAddRule = computed(() => enabled.value && !!props.zoneName)
+
+function isVerified(a: EmailDestinationAddress): boolean {
+  return a.verified != null && a.verified !== ''
+}
 
 async function toggleEnabled(v: boolean) {
   if (!props.zoneId || toggling.value) return
@@ -167,7 +176,7 @@ async function confirmDeleteAddress() {
 }
 
 function openAddRule() {
-  const verified = addresses.value.filter((a) => a.verified)
+  const verified = addresses.value.filter(isVerified)
   ruleForm.value = {
     local: '',
     dest: verified[0]?.email ?? '',
@@ -178,13 +187,17 @@ function openAddRule() {
 
 async function submitRule() {
   if (!props.zoneId) return
+  const zone = props.zoneName?.replace(/\.$/, '') || ''
+  if (!zone) {
+    toast.error('域名信息尚未加载，请稍后再试')
+    return
+  }
   const local = ruleForm.value.local.trim().toLowerCase()
   if (!local || local.includes('@')) {
     toast.error('请填写本地部分，如 info，不要带 @域名')
     return
   }
-  const zone = props.zoneName?.replace(/\.$/, '') || ''
-  const to = zone ? `${local}@${zone}` : local
+  const to = `${local}@${zone}`
   if (ruleForm.value.action === 'forward') {
     if (!ruleForm.value.dest) {
       toast.error('请选择已验证的目标邮箱')
@@ -193,7 +206,7 @@ async function submitRule() {
   }
   creatingRule.value = true
   try {
-    await emailApi.createRule(props.zoneId, {
+    const created = await emailApi.createRule(props.zoneId, {
       name: `${to} → ${ruleForm.value.action === 'drop' ? '丢弃' : ruleForm.value.dest}`,
       enabled: true,
       matchers: [{ type: 'literal', field: 'to', value: to }],
@@ -202,7 +215,11 @@ async function submitRule() {
           ? [{ type: 'drop' }]
           : [{ type: 'forward', value: [ruleForm.value.dest] }],
     })
-    toast.success('规则已创建')
+    toast.success(
+      created.enabled === false
+        ? '规则已创建，但因目标未验证被 Cloudflare 禁用'
+        : '规则已创建',
+    )
     addRuleOpen.value = false
     await loadRules()
   } catch (e) {
@@ -304,8 +321,8 @@ function actionText(r: EmailRoutingRule): string {
           >
             <span class="truncate font-mono">{{ a.email }}</span>
             <div class="flex items-center gap-1">
-              <Badge variant="secondary" :class="a.verified ? 'bg-emerald-500/15 text-emerald-600' : 'bg-amber-500/15 text-amber-600'">
-                {{ a.verified ? '已验证' : '待验证' }}
+              <Badge variant="secondary" :class="isVerified(a) ? 'bg-emerald-500/15 text-emerald-600' : 'bg-amber-500/15 text-amber-600'">
+                {{ isVerified(a) ? '已验证' : '待验证' }}
               </Badge>
               <Button variant="ghost" size="icon-sm" class="text-muted-foreground hover:text-destructive" @click="deleteAddressTarget = a">
                 <Trash2 class="size-3.5" />
@@ -322,7 +339,7 @@ function actionText(r: EmailRoutingRule): string {
           <CardTitle class="text-base">转发规则</CardTitle>
           <CardDescription>匹配收件地址并转发或丢弃。免费档有条数上限，超出由 Cloudflare 报错。</CardDescription>
         </div>
-        <Button size="sm" :disabled="!enabled" @click="openAddRule">
+        <Button size="sm" :disabled="!canAddRule" @click="openAddRule">
           <Plus class="size-4" />
           添加规则
         </Button>
@@ -387,12 +404,12 @@ function actionText(r: EmailRoutingRule): string {
             <Select v-model="ruleForm.dest">
               <SelectTrigger class="w-full"><SelectValue placeholder="选择已验证地址" /></SelectTrigger>
               <SelectContent>
-                <SelectItem v-for="a in addresses.filter((x) => x.verified)" :key="a.id" :value="a.email">
+                <SelectItem v-for="a in addresses.filter(isVerified)" :key="a.id" :value="a.email">
                   {{ a.email }}
                 </SelectItem>
               </SelectContent>
             </Select>
-            <p v-if="!addresses.some((a) => a.verified)" class="text-xs text-amber-600">还没有已验证的目标地址</p>
+            <p v-if="!addresses.some(isVerified)" class="text-xs text-amber-600">还没有已验证的目标地址</p>
           </div>
         </div>
         <DialogFooter>

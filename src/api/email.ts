@@ -40,7 +40,7 @@ export interface EmailRoutingRule {
 export interface EmailDestinationAddress {
   id: string
   email: string
-  verified?: boolean
+  verified?: string | null
   created?: string
   modified?: string
   tag?: string
