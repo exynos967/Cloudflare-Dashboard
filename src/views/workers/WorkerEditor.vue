@@ -24,11 +24,11 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
-import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Separator } from '@/components/ui/separator'
+import CodeEditor from '@/components/editor/CodeEditor.vue'
 import {
   Tabs,
   TabsContent,
@@ -507,11 +507,10 @@ async function confirmDeleteSecret() {
             <div v-if="codeLoading" class="space-y-2">
               <Skeleton class="h-6 w-full" v-for="i in 8" :key="i" />
             </div>
-            <Textarea
+            <CodeEditor
               v-else
               v-model="code"
-              class="min-h-[60vh] font-mono text-xs leading-relaxed"
-              spellcheck="false"
+              height="60vh"
             />
           </TabsContent>
 

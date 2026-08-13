@@ -22,7 +22,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
+import CodeEditor from '@/components/editor/CodeEditor.vue'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import WorkerEditor from './WorkerEditor.vue'
@@ -238,11 +238,7 @@ function fmtDate(s: string): string {
           </div>
           <div class="space-y-1.5">
             <Label for="worker-code">初始代码</Label>
-            <Textarea
-              id="worker-code"
-              v-model="createCode"
-              class="min-h-64 font-mono text-xs"
-            />
+            <CodeEditor v-model="createCode" height="16rem" />
           </div>
         </div>
         <DialogFooter>
