@@ -20,11 +20,33 @@ export interface WorkerScriptMeta {
   handlers: string[]
 }
 
-/** GET /workers/scripts/{name}/settings 返回的既有脚本配置（部分字段） */
-interface WorkerScriptSettings {
-  bindings?: { type: string; name?: string }[] | null
+  /** GET /workers/scripts/{name}/settings 返回的既有脚本配置（部分字段） */
+export interface WorkerBinding {
+  type: string
+  name?: string
+  namespace_id?: string
+  id?: string
+  bucket_name?: string
+  class_name?: string
+  service?: string
+  environment?: string
+  text?: string
+}
+
+export interface WorkerScriptSettings {
+  bindings?: WorkerBinding[] | null
   compatibility_date?: string | null
   compatibility_flags?: string[] | null
+}
+
+export interface WorkerSchedule {
+  cron: string
+  created_on?: string
+}
+
+export interface WorkerSecret {
+  name: string
+  type: string
 }
 
 export const workersApi = {
@@ -139,4 +161,44 @@ export const workersApi = {
 
   deleteDomain: (domainId: string) =>
     http.delete<WorkerDomain>(`/accounts/${accountId()}/workers/domains/${domainId}`),
+
+  /* ---------- settings / cron / secrets ---------- */
+
+  getSettings: (scriptName: string) =>
+    http.get<WorkerScriptSettings>(
+      `/accounts/${accountId()}/workers/scripts/${encodeURIComponent(scriptName)}/settings`,
+    ),
+
+  getSchedules: async (scriptName: string): Promise<WorkerSchedule[]> => {
+    const res = await http.get<{ schedules?: WorkerSchedule[] } | WorkerSchedule[]>(
+      `/accounts/${accountId()}/workers/scripts/${encodeURIComponent(scriptName)}/schedules`,
+    )
+    if (Array.isArray(res)) return res
+    return res?.schedules ?? []
+  },
+
+  /**
+   * PUT 替换整个 cron 列表。调用方必须先 GET 再合并，禁止空数组覆盖未知现网配置。
+   */
+  putSchedules: (scriptName: string, schedules: WorkerSchedule[]) =>
+    http.put<{ schedules?: WorkerSchedule[] }>(
+      `/accounts/${accountId()}/workers/scripts/${encodeURIComponent(scriptName)}/schedules`,
+      { body: { schedules: schedules.map((s) => ({ cron: s.cron })) } },
+    ),
+
+  listScriptSecrets: (scriptName: string) =>
+    http.get<WorkerSecret[]>(
+      `/accounts/${accountId()}/workers/scripts/${encodeURIComponent(scriptName)}/secrets`,
+    ),
+
+  putSecret: (scriptName: string, name: string, text: string) =>
+    http.put<WorkerSecret>(
+      `/accounts/${accountId()}/workers/scripts/${encodeURIComponent(scriptName)}/secrets`,
+      { body: { name, text, type: 'secret_text' } },
+    ),
+
+  deleteSecret: (scriptName: string, secretName: string) =>
+    http.delete<unknown>(
+      `/accounts/${accountId()}/workers/scripts/${encodeURIComponent(scriptName)}/secrets/${encodeURIComponent(secretName)}`,
+    ),
 }
