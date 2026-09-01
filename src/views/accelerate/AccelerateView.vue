@@ -80,8 +80,8 @@ onMounted(loadZones)
 const form = reactive({
   zoneId: '' as string,
   host: '', // zone 下的主机名，如 www 或 @
-  originUrl: '',
-  cacheTtl: 60,
+  targetDomain: '',
+  cacheTtl: 0,
   originDomain: DEFAULT_ORIGIN_DOMAIN,
   customOrigin: '',
   workerName: '',
@@ -173,12 +173,10 @@ async function onDeploy() {
     toast.error('主机名格式不正确', { description: '仅支持单级前缀（字母/数字/连字符），不要填完整域名' })
     return
   }
-  // 源站 URL 用 URL 解析校验，仅接受 http/https
-  try {
-    const u = new URL(form.originUrl.trim())
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('protocol')
-  } catch {
-    toast.error('源站域名格式不正确', { description: '需为完整 URL，如 https://origin.example.com' })
+  // 源站域名：与 cococ 一致的裸主机名（Worker 固定以 HTTPS 回源），不带协议与路径
+  const targetDomain = form.targetDomain.trim().toLowerCase()
+  if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(targetDomain) || !targetDomain.includes('.')) {
+    toast.error('源站域名格式不正确', { description: '填写裸域名即可，如 origin.example.com，不要带 https:// 或路径' })
     return
   }
   if (customOriginMode.value && !form.customOrigin.trim()) {
@@ -197,7 +195,7 @@ async function onDeploy() {
 
   const config: AccelerateConfig = {
     accessDomain: accessDomain.value,
-    originUrl: form.originUrl.trim(),
+    targetDomain,
     cacheTtl: Number(form.cacheTtl) || 0,
     originDomain: originDomainValue.value || DEFAULT_ORIGIN_DOMAIN,
     workerName,
@@ -282,7 +280,8 @@ function originHint(item: AcceleratedZone): string {
         </CardTitle>
         <CardDescription>
           本面板的核心创新功能：自动部署一个回源 Worker 脚本到 Cloudflare 边缘网络，
-          并为访问域名配置 CNAME 指向优选回源域名，实现全站加速。
+          并将访问域名 CNAME（DNS Only）指向优选域名——访客经优选 Cloudflare IP 接入边缘节点，
+          命中 Worker 路由回源，实现全站加速。
         </CardDescription>
       </CardHeader>
       <CardContent class="space-y-3">
@@ -297,8 +296,8 @@ function originHint(item: AcceleratedZone): string {
           <div class="flex items-start gap-2 rounded-lg border bg-muted/30 p-3">
             <Link2 class="mt-0.5 size-4 text-primary" />
             <div>
-              <div class="text-sm font-medium">优选回源域名</div>
-              <div class="text-xs text-muted-foreground">CNAME 指向 cdn.cnno.de 等优选入口</div>
+              <div class="text-sm font-medium">优选域名</div>
+              <div class="text-xs text-muted-foreground">CNAME（灰云）指向 cdn.cnno.de 等优选 IP 入口</div>
             </div>
           </div>
           <div class="flex items-start gap-2 rounded-lg border bg-muted/30 p-3">
@@ -368,18 +367,18 @@ function originHint(item: AcceleratedZone): string {
             <!-- 源站 -->
             <div class="space-y-2">
               <Label>源站域名</Label>
-              <Input v-model="form.originUrl" placeholder="https://origin.example.com" />
-              <p class="text-xs text-muted-foreground">Worker 将请求回源到此地址，需以 http:// 或 https:// 开头</p>
+              <Input v-model="form.targetDomain" placeholder="origin.example.com" />
+              <p class="text-xs text-muted-foreground">你需要加速的网站域名，裸域名即可（Worker 以 HTTPS 回源），不要带 https:// 或路径</p>
             </div>
 
             <div class="grid gap-4 md:grid-cols-2">
               <div class="space-y-2">
                 <Label>缓存时间（秒）</Label>
-                <Input v-model.number="form.cacheTtl" type="number" min="0" placeholder="0 = 不缓存" />
-                <p class="text-xs text-muted-foreground">使用 Cache API 在边缘缓存，0 表示每次回源</p>
+                <Input v-model.number="form.cacheTtl" type="number" min="0" placeholder="0" />
+                <p class="text-xs text-muted-foreground">使用 Cache API 在边缘缓存，0 表示不开启缓存，2592000 为一个月。默认：0</p>
               </div>
               <div class="space-y-2">
-                <Label>优选回源域名</Label>
+                <Label>优选域名</Label>
                 <Select v-model="form.originDomain">
                   <SelectTrigger class="w-full">
                     <SelectValue placeholder="选择优选域名" />
@@ -394,7 +393,7 @@ function originHint(item: AcceleratedZone): string {
                 <Input
                   v-if="customOriginMode"
                   v-model="form.customOrigin"
-                  placeholder="自定义优选回源域名"
+                  placeholder="自定义优选域名"
                 />
               </div>
             </div>
@@ -404,15 +403,15 @@ function originHint(item: AcceleratedZone): string {
               <Input
                 :model-value="form.workerName"
                 @update:model-value="(v: string | number) => { form.workerName = String(v); onWorkerNameInput() }"
-                placeholder="accel-xxx"
+                placeholder="www-example-com"
               />
-              <p class="text-xs text-muted-foreground">默认按访问域名自动生成，可修改</p>
+              <p class="text-xs text-muted-foreground">默认按访问域名自动生成（点替换为连字符，与 cococ.co 约定一致），可修改</p>
             </div>
 
             <!-- 脚本预览 -->
             <WorkerScriptPreview
-              v-if="form.originUrl"
-              :origin-url="form.originUrl"
+              v-if="form.targetDomain"
+              :target-domain="form.targetDomain"
               :cache-ttl="Number(form.cacheTtl) || 0"
             />
 
@@ -466,7 +465,7 @@ function originHint(item: AcceleratedZone): string {
           <CardHeader class="flex-row items-center justify-between space-y-0">
             <div>
               <CardTitle class="text-base">已加速域名</CardTitle>
-              <CardDescription>扫描账号下所有 zone 的 CNAME 匹配优选回源域名 + 校验 Worker 存在</CardDescription>
+              <CardDescription>扫描账号下所有 zone 的 CNAME 精确匹配优选域名 + 校验 Worker 存在</CardDescription>
             </div>
             <Button variant="outline" size="sm" :disabled="detecting" @click="detect">
               <RefreshCw v-if="detecting" class="size-4 animate-spin" />

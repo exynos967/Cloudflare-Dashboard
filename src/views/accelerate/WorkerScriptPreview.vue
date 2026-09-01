@@ -4,13 +4,13 @@ import { computed } from 'vue'
 import { generateWorkerScript } from '@/api/accelerate'
 
 const props = defineProps<{
-  originUrl: string
+  targetDomain: string
   cacheTtl: number
 }>()
 
 const script = computed(() => {
-  if (!props.originUrl) return '// 请填写源站域名'
-  return generateWorkerScript(props.originUrl, props.cacheTtl)
+  if (!props.targetDomain) return '// 请填写源站域名'
+  return generateWorkerScript(props.targetDomain, props.cacheTtl)
 })
 </script>
 

@@ -1,13 +1,14 @@
 /**
- * 一键网站加速编排 API
+ * 一键网站加速编排 API（复刻 cococ.co 的一键加速，纯前端编排，不经过任何第三方后端）
  *
- * 加速编排逻辑：组合调用 zones / dns / workers 三个 API，
- * 在前端完成编排（Cloudflare API 凭据始终由浏览器持有，不在任何服务端落盘）。
- *
- * 流程：
- *   1. 上传 Worker 脚本（脚本内部回源到源站，可选 Cache API 缓存）
- *   2. 在访问域名所在 zone 创建 Worker 路由 + CNAME 指向优选回源域名
- *   3. 「已加速域名」通过对账号下所有 zone 扫描 CNAME 匹配优选回源域名 +
+ * 加速原理（已实测验证）：
+ *   1. 上传回源 Worker 脚本（访问域名/* 路由命中后反向代理到源站，可选 Cache API 缓存）
+ *   2. 创建 Worker 路由 accessDomain/* → Worker
+ *   3. 创建 CNAME accessDomain → 优选域名（cdn.cnno.de 等），proxied=false（DNS Only）。
+ *      优选域名解析到优选 Cloudflare IP，访客经这些 IP 抵达 CF 边缘后仍命中 zone 的
+ *      Worker 路由——这才是「优选加速」生效的关键；proxied=true 会让 CF 返回标准
+ *      任播 IP，CNAME 目标完全失效，加速毫无意义。
+ *   4. 「已加速域名」通过对账号下所有 zone 扫描 CNAME 精确匹配优选域名 +
  *      校验对应 Worker 脚本存在来识别
  */
 import { CFError, http, listAll } from './client'
@@ -17,21 +18,21 @@ import { workersApi } from './workers'
 import { listCustomHostnames } from './saas'
 import type { DNSRecord, DNSRecordPayload, WorkerRoute, Zone } from '@/types/cloudflare'
 
-/** 优选回源域名候选 */
+/** 优选域名候选（CNAME 目标，解析到优选 Cloudflare IP） */
 export const PREFERRED_ORIGIN_DOMAINS = ['cdn.cnno.de', 'cdn.ddeed.de'] as const
 
-/** 默认优选回源域名 */
+/** 默认优选域名 */
 export const DEFAULT_ORIGIN_DOMAIN = 'cdn.cnno.de'
 
 /** 加速部署配置 */
 export interface AccelerateConfig {
   /** 访问域名（完整主机名，如 www.example.com） */
   accessDomain: string
-  /** 源站 URL（如 https://origin.example.com） */
-  originUrl: string
+  /** 源站域名（裸主机名，如 origin.example.com；Worker 以 HTTPS 回源） */
+  targetDomain: string
   /** 缓存时间（秒），0 = 不缓存 */
   cacheTtl: number
-  /** 优选回源域名（CNAME 目标，默认 cdn.cnno.de） */
+  /** 优选域名（CNAME 目标，默认 cdn.cnno.de） */
   originDomain: string
   /** Worker 脚本名称 */
   workerName: string
@@ -72,95 +73,96 @@ function hash6(s: string): string {
 }
 
 /**
- * 根据访问域名生成 Worker 名称。
- * 规则：accel-{访问域名，点替换为连字符}，符合 CF 脚本命名规范（[a-zA-Z0-9_-]，≤63）。
+ * 根据访问域名生成 Worker 名称（与 cococ.co 约定一致：访问域名点替换为连字符，
+ * 如 www.example.com → www-example-com），符合 CF 脚本命名规范（[a-z0-9_-]，≤63）。
+ * 与 cococ 保持同名约定可让两边部署的加速互相识别与管理。
  */
 export function generateWorkerName(accessDomain: string): string {
-  const slug = accessDomain.toLowerCase().replace(/[^a-z0-9.-]/g, '').replace(/\./g, '-')
-  const name = `accel-${slug}`
+  const name = normalizeDomain(accessDomain)
+    .replace(/[^a-z0-9.]/g, '')
+    .replace(/\./g, '-')
+    .replace(/^-+|-+$/g, '')
   // Cloudflare 脚本名最长 63 字符；截断时附完整域名 hash 后缀，避免不同长域名截断撞名（删除时误伤）
   if (name.length <= 63) return name
   return `${name.slice(0, 56)}-${hash6(normalizeDomain(accessDomain))}`
 }
 
 /**
- * 生成回源 Worker 脚本源码。
+ * 生成回源 Worker 脚本源码（复刻 cococ.co 部署的脚本逻辑，并修复其 max-age 为空的后端模板 bug）。
  *
- * 纯透传：把请求路径透传到源站 originUrl。
- * 不用 Cache API——子请求配额有限（50 次/请求），手搓缓存键易撞配额导致整页 500；
- * 缓存交给 CF 边缘缓存 + 源站 Cache-Control 头，更稳。
- * 语法为 ES module 形式（Cloudflare Workers 标准）。
+ * 行为与 cococ 一致：
+ *   - 仅改 hostname 回源到 targetDomain（HTTPS，Host 头同步修正），redirect: manual 不跟随跳转
+ *   - 非 GET/HEAD 动态请求（登录提交等）直接透传，绝不进缓存
+ *   - GET/HEAD 且 cacheTtl > 0 时走 Cache API：缓存键为原始访问 URL，只缓存 200，
+ *     缓存路径统一剥离 Set-Cookie（防止把他人登录态缓存后群发给所有访客）
+ *   - cacheTtl = 0 时完全绕过 Cache API，纯透传
+ * 语法为 ES module 形式（workersApi.uploadScript 以 main_module 上传）。
  */
-export function generateWorkerScript(originUrl: string, cacheTtl: number): string {
+export function generateWorkerScript(targetDomain: string, cacheTtl: number): string {
   const ttl = Math.max(0, Math.floor(cacheTtl || 0))
   return `/**
  * 一键加速 Worker（由 Cloudflare-Dashboard 生成）
- * 源站：${originUrl}
- * 缓存 TTL：${ttl} 秒（0 = 不缓存，>0 时按 s-maxage 提示边缘缓存）
+ * 源站：${targetDomain}
+ * 缓存 TTL：${ttl} 秒（0 = 不缓存）
  */
-const ORIGIN_URL = ${JSON.stringify(originUrl)};
+const TARGET_HOST = ${JSON.stringify(targetDomain)};
 const CACHE_TTL = ${ttl};
 
-// 回源请求头白名单：只透传这些，避免带 hop-by-hop / CF 内部头干扰源站
-const REQ_HEADERS = [
-  'accept', 'accept-encoding', 'accept-language', 'authorization',
-  'content-type', 'content-length', 'user-agent', 'cache-control',
-  'pragma', 'origin', 'referer', 'cookie', 'x-requested-with', 'range',
-];
-// 回源响应头白名单：不透传 location(避免暴露源站)、content-length/content-encoding
-// (resp.body 是流,CF 用 chunked 传输,透传这俩会头体不符导致连接被掐 ERR_CONNECTION_CLOSED)
-const RESP_HEADERS = [
-  'content-type', 'content-disposition',
-  'cache-control', 'etag', 'last-modified', 'expires', 'vary', 'set-cookie',
-];
-
-function buildProxyHeaders(src, targetHost) {
-  const h = new Headers();
-  for (const [k, v] of src.entries()) {
-    if (REQ_HEADERS.includes(k.toLowerCase())) h.set(k, v);
-  }
-  h.set('Host', targetHost);
-  if (!h.has('User-Agent')) {
-    h.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-  }
-  return h;
-}
-
 export default {
-  async fetch(request) {
-    const reqUrl = new URL(request.url);
-    const target = new URL(reqUrl.pathname + reqUrl.search, ORIGIN_URL);
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    url.hostname = TARGET_HOST;
 
-    // 构造回源请求：白名单请求头 + 修正 Host，GET/HEAD 不得带 body
-    const hasBody = request.method !== 'GET' && request.method !== 'HEAD' && request.body != null;
-    const originReq = new Request(target, {
+    // 透传请求头并修正 Host；redirect: manual 避免 Worker 内吞掉 3xx 暴露源站跳转目标
+    const headers = new Headers(request.headers);
+    headers.set('Host', TARGET_HOST);
+    const originRequest = new Request(url.toString(), {
       method: request.method,
-      headers: buildProxyHeaders(request.headers, target.host),
-      body: hasBody ? request.body : undefined,
-      redirect: 'follow',
+      headers,
+      body: request.body,
+      redirect: 'manual',
     });
 
-    let resp;
-    try {
-      resp = await fetch(originReq);
-    } catch (err) {
-      return new Response('Origin unreachable: ' + (err && err.message ? err.message : String(err)), {
-        status: 502,
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-      });
+    // 动态请求（POST/PUT/DELETE 等）与未开启缓存的 GET/HEAD 直接回源，不碰 Cache API
+    if (CACHE_TTL <= 0 || (request.method !== 'GET' && request.method !== 'HEAD')) {
+      return fetch(originRequest);
     }
 
-    // 响应头白名单透传（不含 location），重写为可变头方便加 s-maxage
-    const outHeaders = new Headers();
-    for (const [k, v] of resp.headers.entries()) {
-      if (RESP_HEADERS.includes(k.toLowerCase())) outHeaders.set(k, v);
+    // GET/HEAD 静态请求走 Cache API，缓存键用原始访问 URL
+    const cache = caches.default;
+    const cacheKey = new Request(request.url, request);
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      const hit = new Response(cached.body, cached);
+      hit.headers.set('CF-Cache-Status', 'HIT');
+      return hit;
     }
-    // 缓存仅靠 s-maxage 头提示 CF 边缘缓存，不在 Worker 内动 Cache API（省 subrequest 配额）
-    if (CACHE_TTL > 0 && resp.ok && (request.method === 'GET' || request.method === 'HEAD')) {
-      outHeaders.set('Cache-Control', 's-maxage=' + CACHE_TTL + ', max-age=0');
+
+    const originResponse = await fetch(originRequest);
+    const newHeaders = new Headers(originResponse.headers);
+    // 清掉源站缓存头，缓存策略由本 Worker 统一管理
+    newHeaders.delete('Cache-Control');
+    newHeaders.delete('Pragma');
+    newHeaders.delete('Expires');
+    // 安全防护：缓存路径不透传 Set-Cookie，防止把他人登录态缓存后群发给所有访客
+    newHeaders.delete('Set-Cookie');
+
+    const response = new Response(originResponse.body, {
+      status: originResponse.status,
+      statusText: originResponse.statusText,
+      headers: newHeaders,
+    });
+    // 只缓存 200，避免缓存 404/500 报错页
+    if (response.status === 200) {
+      response.headers.set('Cache-Control', 'public, max-age=' + CACHE_TTL);
+      response.headers.set('CF-Cache-Status', 'MISS');
+      ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    } else {
+      response.headers.set('Cache-Control', 'no-store, max-age=0');
+      response.headers.set('CF-Cache-Status', 'BYPASS');
     }
-    return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: outHeaders });
-  }
+    return response;
+  },
 }
 `
 }
@@ -187,7 +189,7 @@ function normalizeDomain(s: string): string {
  * 取其 script 作为真实 Worker 名（自定义命名的部署也能识别），找不到路由才回退按命名约定推导。
  *
  * @param zones zone 列表
- * @param originDomains 优选回源域名集合，默认 PREFERRED_ORIGIN_DOMAINS
+ * @param originDomains 优选域名集合，默认 PREFERRED_ORIGIN_DOMAINS
  */
 export async function detectAccelerated(
   zones: Zone[],
@@ -237,7 +239,8 @@ export async function detectAccelerated(
       const found: AcceleratedZone[] = []
       for (const record of records) {
         const content = normalizeDomain(record.content)
-        const hit = domains.some((d) => content === d || content.endsWith('.' + d))
+        // 与 cococ 一致：CNAME 目标精确等于优选域名才算加速记录（子域后缀不算）
+        const hit = domains.some((d) => content === d)
         if (!hit) continue
         // 已是 SaaS 优选 custom hostname 的访问域名，跳过（避免误判为 Worker 缺失的加速记录）
         if (saasHostnames.has(normalizeDomain(record.name))) continue
@@ -276,7 +279,7 @@ function findZoneForAccessDomain(zones: Zone[], accessDomain: string): Zone | un
  *   ① 找到 accessDomain 对应的 zone
  *   ② 上传 Worker 脚本
  *   ③ 创建 Worker 路由（accessDomain/* → workerName）
- *   ④ 创建 CNAME 记录指向优选回源域名（作为加速标记 + 兜底解析）
+ *   ④ 创建 CNAME 记录指向优选域名（proxied=false，访客 DNS 解析直达优选 CF IP）
  *
  * @param config 部署配置
  * @param onProgress 步骤进度回调
@@ -285,7 +288,7 @@ export async function deployAccelerate(
   config: AccelerateConfig,
   onProgress?: (p: DeployProgress) => void,
 ): Promise<{ zone: Zone; record: DNSRecord; workerName: string }> {
-  const { accessDomain, originUrl, originDomain, workerName } = config
+  const { accessDomain, targetDomain, originDomain, workerName } = config
 
   // ① 确定访问域名所属 zone：优先用调用方指定的 zoneId（校验域名归属），未指定才按域名反查
   let zone: Zone
@@ -326,7 +329,7 @@ export async function deployAccelerate(
 
   // ② 上传 Worker 脚本
   onProgress?.({ step: 'upload', message: '正在上传 Worker 脚本…', ok: true })
-  const script = generateWorkerScript(originUrl, config.cacheTtl)
+  const script = generateWorkerScript(targetDomain, config.cacheTtl)
   await workersApi.uploadScript(workerName, script)
 
   /**
@@ -392,7 +395,10 @@ export async function deployAccelerate(
     }
   }
 
-  // ④ 创建/更新 CNAME 指向优选回源域名
+  // ④ 创建/更新 CNAME 指向优选域名（proxied=false / DNS Only）
+  //    优选域名解析到优选 Cloudflare IP，访客经优选 IP 接入 CF 边缘后命中 Worker 路由——
+  //     proxied=true 会让 CF 忽略 CNAME 目标直接返回标准任播 IP，优选完全失效（这正是修复前
+  //    「一键加速没有用」的根因）。
   //    部署意图就是把域名指向加速入口：同名 A/AAAA 冲突记录先删除再建（否则 CNAME 必失败）；
   //    删除前保存完整 payload，新 CNAME 失败时依次重建被删记录，不让域名解析处于真空态
   let record: DNSRecord
@@ -425,7 +431,7 @@ export async function deployAccelerate(
         type: 'CNAME',
         name: accessDomain,
         content: originDomain,
-        proxied: true,
+        proxied: false,
         comment: '一键加速 CNAME',
       })
     } else {
@@ -433,7 +439,7 @@ export async function deployAccelerate(
         type: 'CNAME',
         name: accessDomain,
         content: originDomain,
-        proxied: true,
+        proxied: false,
         comment: '一键加速 CNAME',
       })
     }
